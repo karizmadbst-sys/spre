@@ -1,0 +1,10 @@
+{
+  "name": "Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix Remix DEEP TILE — 3D Poolrooms Horror Survival",
+  "description": "A 3D liminal indoor swimming pool horror survival game with 10 parkour sectors, intelligent aquatic monster AI, procedural PBR graphics, and Web Audio soundscape.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "default",
+  "description": "Default window capabilities for SERPENTIS Windows desktop client",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

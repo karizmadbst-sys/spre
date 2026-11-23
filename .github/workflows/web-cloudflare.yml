@@ -1,0 +1,154 @@
+name: Web & Cloudflare Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: Typecheck, Worker Check & Multiplayer Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --legacy-peer-deps
+          else
+            npm install --no-audit --no-fund --legacy-peer-deps
+          fi
+      - run: npm run lint
+      - run: npm run typecheck:worker
+      - run: npm run test:multiplayer
+      - run: npm run build
+
+  deploy-cloudflare:
+    name: Deploy Worker & Pages
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --legacy-peer-deps
+          else
+            npm install --no-audit --no-fund --legacy-peer-deps
+          fi
+
+      - name: Check Cloudflare Credentials
+        id: cf-creds
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID secret is not set — skipping Cloudflare remote deploy. Add both in GitHub Repo Settings → Secrets and variables → Actions to enable auto-deploy."
+          fi
+
+      - name: Install Wrangler CLI
+        if: ${{ steps.cf-creds.outputs.configured == 'true' }}
+        run: npm install -g wrangler@latest --no-audit --no-fund
+
+      - name: Resolve or Auto-Create D1 Database
+        if: ${{ steps.cf-creds.outputs.configured == 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VAR_D1_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID }}
+          SECRET_D1_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+        run: |
+          set -o pipefail
+          D1_ID="${VAR_D1_ID:-$SECRET_D1_ID}"
+          if [ -z "$D1_ID" ]; then
+            echo "No CLOUDFLARE_D1_DATABASE_ID configured — looking up existing D1 database 'deep-tile-db'..."
+            D1_ID="$(wrangler d1 list --json | node -e '
+              const data = JSON.parse(require("fs").readFileSync(0, "utf8") || "[]");
+              const found = Array.isArray(data) ? data.find((d) => d.name === "deep-tile-db") : null;
+              if (found && found.uuid) process.stdout.write(found.uuid);
+            ')"
+          fi
+          if [ -z "$D1_ID" ]; then
+            echo "D1 database 'deep-tile-db' not found — creating it automatically..."
+            wrangler d1 create deep-tile-db
+            D1_ID="$(wrangler d1 list --json | node -e '
+              const data = JSON.parse(require("fs").readFileSync(0, "utf8") || "[]");
+              const found = Array.isArray(data) ? data.find((d) => d.name === "deep-tile-db") : null;
+              if (found && found.uuid) process.stdout.write(found.uuid);
+            ')"
+          fi
+          if [ -z "$D1_ID" ]; then
+            echo "::error::Failed to resolve or create Cloudflare D1 database 'deep-tile-db'. Ensure your CLOUDFLARE_API_TOKEN has D1:Edit permission or set CLOUDFLARE_D1_DATABASE_ID."
+            exit 1
+          fi
+          echo "Using D1 database ID: $D1_ID"
+          sed -i "s/REPLACE_WITH_YOUR_D1_DATABASE_ID/$D1_ID/g" cloudflare/wrangler.toml
+
+      - name: Apply D1 Migrations
+        if: ${{ steps.cf-creds.outputs.configured == 'true' }}
+        working-directory: cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: wrangler d1 migrations apply deep-tile-db --remote
+
+      - name: Deploy Multiplayer Worker
+        id: deploy-worker
+        if: ${{ steps.cf-creds.outputs.configured == 'true' }}
+        working-directory: cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          wrangler deploy 2>&1 | tee /tmp/wrangler-deploy.log
+          WORKER_URL="$(grep -Eo 'https://[a-zA-Z0-9._-]+\.workers\.dev' /tmp/wrangler-deploy.log | head -n 1 || true)"
+          if [ -n "$WORKER_URL" ]; then
+            echo "url=$WORKER_URL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve Cloudflare Worker URL
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+          VITE_WS_BASE_URL: ${{ vars.VITE_WS_BASE_URL }}
+          DEPLOYED_WORKER_URL: ${{ steps.deploy-worker.outputs.url }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/resolve-cloudflare-worker.mjs --github-env
+
+      - name: Build Frontend Bundle for Cloudflare Pages
+        run: npm run build
+
+      - name: Upload Web Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: serpentis-web-dist
+          path: dist
+          if-no-files-found: error
+
+      - name: Deploy Frontend to Cloudflare Pages
+        if: ${{ steps.cf-creds.outputs.configured == 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PAGES_PROJECT: ${{ vars.CLOUDFLARE_PAGES_PROJECT || 'deep-tile' }}
+        run: |
+          wrangler pages project create "$PAGES_PROJECT" --production-branch=main || true
+          wrangler pages deploy dist --project-name="$PAGES_PROJECT" --branch=main

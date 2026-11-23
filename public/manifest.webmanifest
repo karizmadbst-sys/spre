@@ -1,0 +1,33 @@
+{
+  "id": "/",
+  "name": "SERPENTIS",
+  "short_name": "SERPENTIS",
+  "description": "SERPENTIS — Survive 100 eerie flooded indoor poolroom sectors, master floating platform parkour, and evade the giant aquatic sea serpent.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "fullscreen",
+  "display_override": ["fullscreen", "standalone"],
+  "orientation": "landscape",
+  "background_color": "#0b1012",
+  "theme_color": "#0b1012",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png?v=2",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png?v=2",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png?v=2",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
