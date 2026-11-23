@@ -1,15 +1,19 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Check,
   Copy,
+  Link2,
+  Loader2,
   LogOut,
   Play,
   RefreshCw,
   Send,
+  Server,
   UserPlus,
   Users,
   X,
 } from 'lucide-react';
+import type { CoopPendingAction } from '../coop/CoopClient';
 import type {
   CoopConnectionStatus,
   CoopInvite,
@@ -19,6 +23,9 @@ import type {
 
 interface CoopModalProps {
   status: CoopConnectionStatus;
+  pendingAction: CoopPendingAction;
+  serverUrl: string;
+  initialJoinCode?: string;
   localPlayerId: string;
   localFriendCode: string;
   localName: string;
@@ -29,6 +36,7 @@ interface CoopModalProps {
   noticeBanner: string | null;
   inActiveCoopPlay: boolean;
   onNameChange: (name: string) => void;
+  onSaveServerUrl: (url: string) => void;
   onReconnect: () => void;
   onCreateSession: () => void;
   onJoinSessionByCode: (sessionCode: string) => void;
@@ -41,8 +49,27 @@ interface CoopModalProps {
   onClose: () => void;
 }
 
+function buildShareInviteUrl(sessionCode: string, serverUrl: string): string {
+  if (typeof window === 'undefined' || !window.location) return sessionCode;
+  const origin = window.location.origin;
+  if (!origin || origin === 'null' || origin.startsWith('file:')) {
+    return sessionCode;
+  }
+  const url = new URL(window.location.href);
+  url.search = '';
+  url.hash = '';
+  url.searchParams.set('coop', sessionCode);
+  if (serverUrl && !serverUrl.includes(window.location.host)) {
+    url.searchParams.set('server', serverUrl);
+  }
+  return url.toString();
+}
+
 export const CoopModal: React.FC<CoopModalProps> = React.memo(({
   status,
+  pendingAction,
+  serverUrl,
+  initialJoinCode = '',
   localPlayerId,
   localFriendCode,
   localName,
@@ -53,6 +80,7 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
   noticeBanner,
   inActiveCoopPlay,
   onNameChange,
+  onSaveServerUrl,
   onReconnect,
   onCreateSession,
   onJoinSessionByCode,
@@ -65,15 +93,33 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
   onClose,
 }) => {
   const [nameDraft, setNameDraft] = useState(localName);
-  const [joinCodeInput, setJoinCodeInput] = useState('');
+  const [joinCodeInput, setJoinCodeInput] = useState(initialJoinCode);
   const [friendCodeInput, setFriendCodeInput] = useState('');
-  const [copiedKey, setCopiedKey] = useState<'friend' | 'session' | null>(null);
+  const [serverUrlDraft, setServerUrlDraft] = useState(serverUrl);
+  const [showServerConfig, setShowServerConfig] = useState(() => !serverUrl || status === 'disconnected');
+  const [copiedKey, setCopiedKey] = useState<'friend' | 'session' | 'link' | null>(null);
 
-  const handleCopy = (value: string, kind: 'friend' | 'session') => {
+  useEffect(() => {
+    setServerUrlDraft(serverUrl);
+  }, [serverUrl]);
+
+  useEffect(() => {
+    if (initialJoinCode && !joinCodeInput) {
+      setJoinCodeInput(initialJoinCode);
+    }
+  }, [initialJoinCode, joinCodeInput]);
+
+  useEffect(() => {
+    if (!serverUrl || (status === 'disconnected' && errorBanner)) {
+      setShowServerConfig(true);
+    }
+  }, [serverUrl, status, errorBanner]);
+
+  const handleCopy = (value: string, kind: 'friend' | 'session' | 'link') => {
     try {
       void navigator.clipboard?.writeText(value);
       setCopiedKey(kind);
-      window.setTimeout(() => setCopiedKey((cur) => (cur === kind ? null : cur)), 1400);
+      window.setTimeout(() => setCopiedKey((cur) => (cur === kind ? null : cur)), 1600);
     } catch {
       // ignore clipboard errors inside restricted iframes
     }
@@ -93,9 +139,9 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
     status === 'connected'
       ? 'CONNECTED'
       : status === 'reconnecting'
-        ? 'RECONNECTING'
+        ? 'RECONNECTING...'
         : status === 'connecting'
-          ? 'CONNECTING'
+          ? 'CONNECTING...'
           : 'OFFLINE';
 
   const statusColor =
@@ -104,6 +150,11 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
       : status === 'disconnected'
         ? '#e0746a'
         : '#e8b354';
+
+  const isCreating = pendingAction === 'create';
+  const isJoining = pendingAction === 'join';
+  const isActionBusy = pendingAction === 'create' || pendingAction === 'join';
+  const cleanJoinCode = joinCodeInput.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
 
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center p-2.5 sm:p-4 bg-[#070b0d]/92">
@@ -122,10 +173,21 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
               <span>·</span>
               <span>UP TO 6 SURVIVORS</span>
               <span>·</span>
+              <span>100 REGIONS</span>
+              <span>·</span>
               <span>INDEPENDENT CHECKPOINTS</span>
             </div>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => setShowServerConfig((v) => !v)}
+              className="px-2 py-1.5 rounded-md bg-[#121c20] hover:bg-[#19282d] border border-[#2f4146] text-[10px] font-mono uppercase text-[#9cc0c7] flex items-center gap-1 whitespace-nowrap cursor-pointer"
+              title="Configure Co-Op Server URL"
+            >
+              <Server className="w-3 h-3" />
+              Server
+            </button>
             {status !== 'connected' && (
               <button
                 type="button"
@@ -151,12 +213,12 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
         {(errorBanner || noticeBanner) && (
           <div className="flex flex-col gap-1.5">
             {errorBanner && (
-              <div className="px-3 py-1.5 rounded-lg bg-[#291316] border border-[#6e333a] text-[#ffbfc4] text-[11px] font-mono flex items-center justify-between gap-2">
+              <div className="px-3 py-2 rounded-lg bg-[#291316] border border-[#6e333a] text-[#ffbfc4] text-[11px] font-mono flex items-center justify-between gap-2">
                 <span>{errorBanner}</span>
                 <button
                   type="button"
                   onClick={onDismissError}
-                  className="text-[#ff9ea7] hover:text-white cursor-pointer"
+                  className="text-[#ff9ea7] hover:text-white cursor-pointer shrink-0"
                   aria-label="Dismiss error"
                 >
                   <X className="w-3.5 h-3.5" />
@@ -168,6 +230,45 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
                 {noticeBanner}
               </div>
             )}
+          </div>
+        )}
+
+        {/* Optional / Offline Server Address Configuration */}
+        {showServerConfig && (
+          <div className="p-2.5 rounded-lg bg-[#0a1012] border border-[#293c42] flex flex-col gap-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10px] font-mono uppercase tracking-wider text-[#8ab0b8]">
+                Co-Op Server WebSocket Endpoint
+              </span>
+              {serverUrl && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setServerUrlDraft('');
+                    onSaveServerUrl('');
+                  }}
+                  className="text-[9.5px] font-mono uppercase text-[#7fa4ac] hover:text-[#cce5ea] cursor-pointer"
+                >
+                  Reset Default
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <input
+                type="text"
+                value={serverUrlDraft}
+                onChange={(e) => setServerUrlDraft(e.target.value)}
+                placeholder="wss://your-coop-server.example.com/ws/coop"
+                className="flex-1 min-w-0 px-2.5 py-1.5 rounded-md bg-[#121c1f] border border-[#33454b] font-mono text-[11px] text-[#e7f3f5] placeholder:text-[#557077] focus:outline-none focus:border-[#52e0b6]"
+              />
+              <button
+                type="button"
+                onClick={() => onSaveServerUrl(serverUrlDraft.trim())}
+                className="px-3 py-1.5 rounded-md bg-[#162925] hover:bg-[#1f3b35] border border-[#3a806c] text-[10px] font-mono uppercase text-[#8ef5d5] whitespace-nowrap cursor-pointer"
+              >
+                Connect
+              </button>
+            </div>
           </div>
         )}
 
@@ -246,16 +347,26 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
 
                 <button
                   type="button"
+                  disabled={isActionBusy}
                   onClick={onCreateSession}
-                  className="w-full py-2.5 px-3 rounded-lg bg-[#52e0b6] hover:bg-[#6ef0c8] text-[#071113] font-bold text-xs tracking-wider uppercase flex items-center justify-center gap-2 whitespace-nowrap cursor-pointer"
+                  className="w-full py-2.5 px-3 rounded-lg bg-[#52e0b6] hover:bg-[#6ef0c8] disabled:opacity-60 disabled:cursor-wait text-[#071113] font-bold text-xs tracking-wider uppercase flex items-center justify-center gap-2 whitespace-nowrap cursor-pointer"
                 >
-                  <Play className="w-3.5 h-3.5 fill-current" />
-                  Create Co-Op Session
+                  {isCreating ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      Creating Online Room...
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-3.5 h-3.5 fill-current" />
+                      Create Co-Op Session
+                    </>
+                  )}
                 </button>
 
-                <div className="pt-1 border-t border-[#1d2a2e] flex flex-col gap-1.5">
+                <div className="pt-2 border-t border-[#1d2a2e] flex flex-col gap-1.5">
                   <label className="text-[10px] font-mono uppercase tracking-wider text-[#7e9ba2]">
-                    Join by 6-Character Session Code
+                    Join Friend by 6-Character Join Code
                   </label>
                   <div className="flex items-center gap-1.5">
                     <input
@@ -264,8 +375,8 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
                       maxLength={8}
                       onChange={(e) => setJoinCodeInput(e.target.value.toUpperCase())}
                       onKeyDown={(e) => {
-                        if (e.key === 'Enter' && joinCodeInput.trim().length >= 4) {
-                          onJoinSessionByCode(joinCodeInput.trim());
+                        if (e.key === 'Enter' && cleanJoinCode.length >= 4 && !isActionBusy) {
+                          onJoinSessionByCode(cleanJoinCode);
                         }
                       }}
                       placeholder="E.G. K7M9Q2"
@@ -273,45 +384,72 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
                     />
                     <button
                       type="button"
-                      disabled={joinCodeInput.trim().length < 4}
-                      onClick={() => onJoinSessionByCode(joinCodeInput.trim())}
-                      className="px-3.5 py-1.5 rounded-md bg-[#162925] hover:bg-[#1f3b35] disabled:opacity-45 disabled:cursor-not-allowed border border-[#3a806c] text-xs font-bold uppercase tracking-wider text-[#8ef5d5] whitespace-nowrap cursor-pointer"
+                      disabled={cleanJoinCode.length < 4 || isActionBusy}
+                      onClick={() => onJoinSessionByCode(cleanJoinCode)}
+                      className="px-3.5 py-1.5 rounded-md bg-[#162925] hover:bg-[#1f3b35] disabled:opacity-45 disabled:cursor-not-allowed border border-[#3a806c] text-xs font-bold uppercase tracking-wider text-[#8ef5d5] flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
                     >
-                      Join
+                      {isJoining ? (
+                        <>
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          Joining...
+                        </>
+                      ) : (
+                        'Join'
+                      )}
                     </button>
                   </div>
                 </div>
               </>
             ) : (
               <>
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-mono uppercase text-[#7e9ba2]">
-                      Session Code
+                <div className="p-2.5 rounded-lg bg-[#0d1c1f] border border-[#2f6f63] flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-col">
+                    <span className="text-[9.5px] font-mono uppercase tracking-wider text-[#8ab7ad]">
+                      Share Join Code With Friends
                     </span>
-                    <span className="font-mono text-sm font-bold tracking-widest text-[#52e0b6] tabular-nums">
+                    <span className="font-mono text-lg sm:text-xl font-black tracking-[0.22em] text-[#52e0b6] tabular-nums">
                       {session.sessionCode}
                     </span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
                     <button
                       type="button"
                       onClick={() => handleCopy(session.sessionCode, 'session')}
-                      className="px-1.5 py-0.5 rounded bg-[#142024] hover:bg-[#1d2d32] border border-[#31444a] text-[10px] font-mono text-[#b3ccd1] flex items-center gap-1 cursor-pointer"
+                      className="px-2.5 py-1.5 rounded-md bg-[#142a26] hover:bg-[#1d3b36] border border-[#38806c] text-[10px] font-mono uppercase text-[#aaf7df] flex items-center gap-1 cursor-pointer"
                     >
                       {copiedKey === 'session' ? (
                         <Check className="w-3 h-3 text-[#52e0b6]" />
                       ) : (
                         <Copy className="w-3 h-3" />
                       )}
-                      {copiedKey === 'session' ? 'Copied' : 'Copy'}
+                      {copiedKey === 'session' ? 'Copied' : 'Copy Code'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleCopy(buildShareInviteUrl(session.sessionCode, serverUrl), 'link')
+                      }
+                      className="px-2.5 py-1.5 rounded-md bg-[#142026] hover:bg-[#1c2e36] border border-[#355563] text-[10px] font-mono uppercase text-[#bce8f5] flex items-center gap-1 cursor-pointer"
+                    >
+                      {copiedKey === 'link' ? (
+                        <Check className="w-3 h-3 text-[#52e0b6]" />
+                      ) : (
+                        <Link2 className="w-3 h-3" />
+                      )}
+                      {copiedKey === 'link' ? 'Copied' : 'Share Link'}
                     </button>
                   </div>
-                  <span className="text-[10px] font-mono text-[#94b1b7] tabular-nums">
-                    SQUAD {session.players.length}/{session.maxPlayers}
+                </div>
+
+                <div className="flex items-center justify-between text-[10px] font-mono text-[#94b1b7]">
+                  <span>ACTIVE SESSION SQUAD</span>
+                  <span className="tabular-nums">
+                    {session.players.length}/{session.maxPlayers} PLAYERS
                   </span>
                 </div>
 
                 {/* Squad Roster */}
-                <div className="flex flex-col gap-1.5 max-h-44 overflow-y-auto pr-0.5">
+                <div className="flex flex-col gap-1.5 max-h-40 overflow-y-auto pr-0.5">
                   {session.players.map((p) => {
                     const isSelf = p.playerId === localPlayerId;
                     const isHost = p.playerId === session.hostId;
@@ -350,10 +488,10 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
                   <button
                     type="button"
                     onClick={onEnterCoopWorld}
-                    className="flex-1 min-w-[140px] py-2 px-3 rounded-lg bg-[#52e0b6] hover:bg-[#6ef0c8] text-[#071113] font-bold text-xs tracking-wider uppercase flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+                    className="flex-1 min-w-[160px] py-2.5 px-3 rounded-lg bg-[#52e0b6] hover:bg-[#6ef0c8] text-[#071113] font-bold text-xs tracking-wider uppercase flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
                   >
                     <Play className="w-3.5 h-3.5 fill-current" />
-                    {inActiveCoopPlay ? 'Resume Co-Op World' : 'Enter Co-Op World'}
+                    {inActiveCoopPlay ? 'Resume Co-Op Open World' : 'Enter Co-Op Open World'}
                   </button>
                   <button
                     type="button"
@@ -373,7 +511,7 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
             {/* Invite by Friend Code */}
             <div className="flex flex-col gap-1">
               <label className="text-[10px] font-mono uppercase tracking-wider text-[#7e9ba2]">
-                Invite by Friend Code
+                Invite Online Friend by Code
               </label>
               <div className="flex items-center gap-1.5">
                 <input
@@ -459,7 +597,7 @@ export const CoopModal: React.FC<CoopModalProps> = React.memo(({
               </div>
               {otherOnlineUsers.length === 0 ? (
                 <div className="py-3 text-center text-[11px] font-mono text-[#627e85]">
-                  Share your Friend Code or Session Code to invite teammates.
+                  Share your Join Code or Invite Link so friends can join your world.
                 </div>
               ) : (
                 <div className="flex flex-col gap-1 max-h-36 overflow-y-auto pr-0.5">

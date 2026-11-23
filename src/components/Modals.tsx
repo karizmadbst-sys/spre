@@ -218,7 +218,7 @@ export const MainMenu: React.FC<MainMenuProps> = React.memo(({
               className="relative min-h-[36px] sm:min-h-[40px] px-3.5 sm:px-4 py-2 rounded-lg bg-[#112028] hover:bg-[#18303b] border border-[#3e7d94] text-[#9be4f7] font-bold text-xs tracking-wider uppercase flex items-center justify-center gap-1.5 whitespace-nowrap transition-colors cursor-pointer"
             >
               <Users className="w-3.5 h-3.5" />
-              <span>Co-Op</span>
+              <span>Co-Op Open World</span>
               {pendingCoopInviteCount > 0 && (
                 <span className="ml-0.5 px-1.5 py-0.2 rounded bg-[#52e0b6] text-[#071113] font-mono text-[10px] font-bold tabular-nums">
                   {pendingCoopInviteCount}

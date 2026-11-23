@@ -722,6 +722,7 @@ export class PoolGameEngine {
   private coopEmitTimer = 0;
   private coopDeathSeq = 0;
   private coopRespawnSentForSeq = 0;
+  private coopRespawnAppliedForSeq = 0;
 
   // Adaptive performance tracking
   private activeQuality: ActiveQualityTier = 'standard';
@@ -1742,7 +1743,8 @@ export class PoolGameEngine {
     this.lastAnimState = 'idle';
     this.lastHorizSpeed = 0;
     this.coopDeathSeq = Math.max(this.coopDeathSeq || 0, you.deathSeq || 0);
-    this.coopRespawnSentForSeq = 0;
+    this.coopRespawnSentForSeq = this.coopDeathSeq;
+    this.coopRespawnAppliedForSeq = this.coopDeathSeq;
     resetPlayerRigPose(this.playerRig);
     this.playerRig.setVisible(true);
     this.virtualMove.x = 0;
@@ -1939,16 +1941,19 @@ export class PoolGameEngine {
           this.jumpscareMonster.eatingUserId = null;
           this.jumpscareMonster.eatingProgress = -1;
         }
+        this.coopRespawnAppliedForSeq = Math.max(this.coopRespawnAppliedForSeq || 0, respawn.deathSeq);
         this.respawnSinglePlayerAtLevelStart(this.deathReason || 'caught');
       } else if (
         this.phase === 'playing' &&
-        Math.hypot(this.playerPos.x - respawn.x, this.playerPos.z - respawn.z) > 2.5 &&
-        respawn.deathSeq >= this.coopDeathSeq
+        respawn.deathSeq > (this.coopRespawnAppliedForSeq || 0)
       ) {
+        this.coopRespawnAppliedForSeq = respawn.deathSeq;
         this.playerPos.set(respawn.x, respawn.y, respawn.z);
         this.playerVel.set(0, 0, 0);
         this.playerYaw = respawn.yaw;
         this.updateOpenWorldStreaming(true);
+        this.syncOpenWorldCheckpointVisuals();
+        this.respawnAtActiveCheckpoint(false);
         this.syncLocalPlayerRigTransform('idle', 0);
         this.snapPlayCameraImmediate();
       }
@@ -9768,6 +9773,9 @@ export class PoolGameEngine {
       this.lastCamThirdPerson = this.isThirdPersonView();
 
       this.phase = 'playing';
+      if (this.coopMode) {
+        this.coopRespawnAppliedForSeq = Math.max(this.coopRespawnAppliedForSeq || 0, this.coopDeathSeq || 0);
+      }
       this.needsStaticRender = true;
       this.resetFpsTracker();
 

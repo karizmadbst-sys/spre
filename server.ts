@@ -15,9 +15,36 @@ export async function createAppServer(options: ServerOptions = {}) {
   const coopManager = new CoopServerManager(options.coop);
   coopManager.attachToHttpServer(server, '/ws/coop');
 
+  app.use('/api', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
   app.get('/api/health', (_req, res) => {
     const stats = coopManager.getStats();
-    res.json({ ok: true, coop: true, ...stats });
+    res.json({ ok: true, coop: true, runtime: 'node-express-ws', ...stats });
+  });
+
+  app.get('/api/coop/session/:code', (req, res) => {
+    const snapshot = coopManager.getSessionSnapshotByCode(req.params.code || '');
+    if (!snapshot) {
+      res.status(404).json({ ok: true, exists: false });
+      return;
+    }
+    res.json({
+      ok: true,
+      exists: true,
+      sessionId: snapshot.sessionId,
+      sessionCode: snapshot.sessionCode,
+      playerCount: snapshot.players.length,
+      maxPlayers: snapshot.maxPlayers,
+    });
   });
 
   const shouldAttachVite = options.attachVite ?? process.env.NODE_ENV !== 'production';
@@ -29,7 +56,7 @@ export async function createAppServer(options: ServerOptions = {}) {
       server: {
         middlewareMode: true,
         allowedHosts: true,
-        ws: { server },
+        hmr: process.env.DISABLE_HMR === 'true' ? false : { server },
       },
       appType: 'spa',
     });

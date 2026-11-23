@@ -1,5 +1,6 @@
-import type { PlayerAnimState } from '../game/entities.ts';
 import type { CharacterId } from '../game/types.ts';
+
+export type CoopAnimState = 'idle' | 'walk' | 'run' | 'jump' | 'fall' | 'swim';
 
 export const COOP_MAX_PLAYERS = 6;
 export const COOP_EAT_DURATION_MS = 2300;
@@ -58,7 +59,7 @@ export interface CoopPlayerSnapshot {
   y: number;
   z: number;
   yaw: number;
-  animState: PlayerAnimState;
+  animState: CoopAnimState;
   horizSpeed: number;
   regionId: number;
   inWater: boolean;
@@ -111,7 +112,7 @@ export interface CoopPlayerMoveBroadcast {
   y: number;
   z: number;
   yaw: number;
-  animState: PlayerAnimState;
+  animState: CoopAnimState;
   horizSpeed: number;
   regionId: number;
   inWater: boolean;
@@ -181,7 +182,7 @@ export type CoopClientMessage =
       y: number;
       z: number;
       yaw: number;
-      animState: PlayerAnimState;
+      animState: CoopAnimState;
       horizSpeed: number;
       regionId: number;
       inWater: boolean;

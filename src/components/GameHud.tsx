@@ -208,17 +208,33 @@ export const GameHud: React.FC<GameHudProps> = React.memo(
 
           {isCoop && coopSession && (
             <div className="pointer-events-auto flex flex-col items-end gap-1">
-              <button
-                type="button"
-                onClick={onOpenCoop}
-                className="px-2 py-1 rounded-md bg-[#0c1315]/85 border border-[#365a62] hover:border-[#52e0b6] text-[10px] font-mono text-[#c5e5ea] flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
-              >
-                <Users className="w-3 h-3 text-[#52e0b6]" />
-                <span>CO-OP {coopSession.sessionCode}</span>
-                <span className="text-[#85a8b0] tabular-nums">
-                  {coopSession.players.length}/{coopSession.maxPlayers}
-                </span>
-              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={onOpenCoop}
+                  className="px-2 py-1 rounded-md bg-[#0c1315]/88 border border-[#365a62] hover:border-[#52e0b6] text-[10px] font-mono text-[#c5e5ea] flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+                >
+                  <Users className="w-3 h-3 text-[#52e0b6]" />
+                  <span>JOIN CODE: {coopSession.sessionCode}</span>
+                  <span className="text-[#85a8b0] tabular-nums">
+                    {coopSession.players.length}/{coopSession.maxPlayers}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    try {
+                      void navigator.clipboard?.writeText(coopSession.sessionCode);
+                    } catch {
+                      // ignore clipboard restrictions
+                    }
+                  }}
+                  title="Copy Join Code"
+                  className="px-1.5 py-1 rounded-md bg-[#0c1315]/88 border border-[#365a62] hover:border-[#52e0b6] text-[9.5px] font-mono uppercase text-[#8ef5d5] cursor-pointer"
+                >
+                  Copy
+                </button>
+              </div>
 
               {remoteTeammates.length > 0 && (
                 <div className="hidden sm:flex flex-col items-end gap-0.5 px-2 py-1 rounded-md bg-[#0c1315]/80 border border-[#2a3b40]">

@@ -8,7 +8,6 @@ import {
   OPEN_WORLD_BOUNDS,
   OPEN_WORLD_SPAWN,
 } from '../game/openWorld.ts';
-import type { PlayerAnimState } from '../game/entities.ts';
 import { normalizeCharacterId, type CharacterId } from '../game/types.ts';
 import {
   COOP_MAX_PLAYERS,
@@ -16,6 +15,7 @@ import {
   COOP_SERVER_RESPAWN_FAILSAFE_MS,
   deriveFriendCode,
   sanitizePlayerName,
+  type CoopAnimState,
   type CoopClientMessage,
   type CoopInvite,
   type CoopOnlineUser,
@@ -26,7 +26,7 @@ import {
   type CoopSessionSnapshot,
 } from './types.ts';
 
-const VALID_ANIM_STATES = new Set<PlayerAnimState>([
+const VALID_ANIM_STATES = new Set<CoopAnimState>([
   'idle',
   'walk',
   'run',
@@ -35,9 +35,9 @@ const VALID_ANIM_STATES = new Set<PlayerAnimState>([
   'swim',
 ]);
 
-function normalizeAnimState(raw: unknown): PlayerAnimState {
-  return typeof raw === 'string' && VALID_ANIM_STATES.has(raw as PlayerAnimState)
-    ? (raw as PlayerAnimState)
+function normalizeAnimState(raw: unknown): CoopAnimState {
+  return typeof raw === 'string' && VALID_ANIM_STATES.has(raw as CoopAnimState)
+    ? (raw as CoopAnimState)
     : 'idle';
 }
 
@@ -165,6 +165,12 @@ export class CoopServerManager {
 
   public getSessionSnapshot(sessionId: string): CoopSessionSnapshot | null {
     const s = this.sessions.get(sessionId);
+    return s ? this.toSessionSnapshot(s) : null;
+  }
+
+  public getSessionSnapshotByCode(sessionCode: string): CoopSessionSnapshot | null {
+    const normalized = sessionCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const s = normalized ? this.sessionsByCode.get(normalized) : undefined;
     return s ? this.toSessionSnapshot(s) : null;
   }
 
@@ -598,13 +604,14 @@ export class CoopServerManager {
       targetSession = this.sessions.get(sessionId);
     }
     if (!targetSession && sessionCode) {
-      targetSession = this.sessionsByCode.get(sessionCode.trim().toUpperCase());
+      const normalized = sessionCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+      targetSession = normalized ? this.sessionsByCode.get(normalized) : undefined;
     }
     if (!targetSession) {
       this.sendWs(client.ws, {
         type: 'coop:error',
         code: 'SESSION_NOT_FOUND',
-        message: 'Co-op session no longer exists.',
+        message: 'Co-op session not found or has expired.',
       });
       return false;
     }

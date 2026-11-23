@@ -1,0 +1,15 @@
+name = "deep-tile-multiplayer"
+main = "src/index.ts"
+compatibility_date = "2025-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ALLOWED_ORIGINS = "*"
+
+[[durable_objects.bindings]]
+name = "COOP_HUB"
+class_name = "CoopHubDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CoopHubDO"]

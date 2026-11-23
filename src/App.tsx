@@ -14,7 +14,13 @@ import {
   VictoryModal,
 } from './components/Modals';
 import { TouchControls, TouchControlsCustomizer } from './components/TouchControls';
-import { CoopClient, detectCoopPlatform } from './coop/CoopClient';
+import {
+  CoopClient,
+  detectCoopPlatform,
+  resolveDefaultCoopWsUrl,
+  setStoredCoopServerUrl,
+  type CoopPendingAction,
+} from './coop/CoopClient';
 import {
   deriveFriendCode,
   sanitizePlayerName,
@@ -94,6 +100,32 @@ function cloneCoopSession(session: CoopSessionSnapshot | null): CoopSessionSnaps
     ...session,
     players: session.players.map((p) => ({ ...p })),
   };
+}
+
+function parseInitialCoopParams(): { joinCode: string; hasInviteLink: boolean } {
+  if (typeof window === 'undefined' || !window.location) {
+    return { joinCode: '', hasInviteLink: false };
+  }
+  try {
+    const url = new URL(window.location.href);
+    const serverParam = url.searchParams.get('server')?.trim();
+    if (serverParam) {
+      setStoredCoopServerUrl(serverParam);
+    }
+    const rawCode = url.searchParams.get('coop') || '';
+    const cleanCode = rawCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (serverParam || rawCode) {
+      url.searchParams.delete('coop');
+      url.searchParams.delete('server');
+      window.history.replaceState?.({}, '', url.toString());
+    }
+    return {
+      joinCode: cleanCode.length >= 4 ? cleanCode : '',
+      hasInviteLink: cleanCode.length >= 4,
+    };
+  } catch {
+    return { joinCode: '', hasInviteLink: false };
+  }
 }
 
 function loadCharacterId(): CharacterId {
@@ -203,10 +235,13 @@ export default function App() {
   const engineRef = useRef<PoolGameEngine | null>(null);
   const coopClientRef = useRef<CoopClient | null>(null);
 
+  const [initialCoopParams] = useState(() => parseInitialCoopParams());
   const [coopPlayerId] = useState<string>(() => loadOrCreateCoopPlayerId());
   const [coopName, setCoopName] = useState<string>(() => loadCoopPlayerName());
   const [coopFriendCode, setCoopFriendCode] = useState<string>(() => deriveFriendCode(coopPlayerId));
   const [coopStatus, setCoopStatus] = useState<CoopConnectionStatus>('disconnected');
+  const [coopPendingAction, setCoopPendingAction] = useState<CoopPendingAction>(null);
+  const [coopServerUrl, setCoopServerUrl] = useState<string>(() => resolveDefaultCoopWsUrl());
   const [coopSession, setCoopSession] = useState<CoopSessionSnapshot | null>(null);
   const [coopOnlineUsers, setCoopOnlineUsers] = useState<CoopOnlineUser[]>([]);
   const [coopInvites, setCoopInvites] = useState<CoopInvite[]>([]);
@@ -221,7 +256,7 @@ export default function App() {
   const [saveData, setSaveData] = useState<SaveData>(() => loadSaveData());
   const [showLevels, setShowLevels] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [showCoop, setShowCoop] = useState(false);
+  const [showCoop, setShowCoop] = useState(() => initialCoopParams.hasInviteLink);
   const [showTouchCustomizer, setShowTouchCustomizer] = useState(false);
   const [returnToSettingsAfterCustomize, setReturnToSettingsAfterCustomize] = useState(false);
   const [deathReason, setDeathReason] = useState<'caught' | 'timeout'>('caught');
@@ -248,6 +283,7 @@ export default function App() {
   const activeLevelIdRef = useRef<number>(1);
   const activeWorldModeRef = useRef<'sector' | 'open_world'>('sector');
   const activeCoopSessionIdRef = useRef<string | null>(null);
+  const coopLaunchIntentRef = useRef<'stay_in_lobby' | 'auto_enter'>('auto_enter');
   const phaseRef = useRef<GamePhase>('menu');
   const transitionTokenRef = useRef<number>(0);
   const fadeTimerRef = useRef<number | null>(null);
@@ -326,34 +362,56 @@ export default function App() {
       setIsTransitioningToPlay(true);
 
       void (async () => {
-        await waitAnimationFrames(1);
-        if (transitionTokenRef.current !== token) return;
+        try {
+          await waitAnimationFrames(1);
+          if (transitionTokenRef.current !== token) return;
 
-        await preloadCoreAssets();
-        if (transitionTokenRef.current !== token) return;
+          await preloadCoreAssets();
+          if (transitionTokenRef.current !== token) return;
 
-        const engine = engineRef.current;
-        if (engine) {
-          await engine.prepareCoopOpenWorldAsync(
-            you,
-            session.players,
-            (pct, label) => updateLoadingProgress(token, pct, label)
-          );
+          const engine = engineRef.current;
+          if (engine) {
+            const latestSession = coopClientRef.current?.session;
+            const latestPlayers =
+              latestSession && latestSession.sessionId === session.sessionId
+                ? latestSession.players
+                : session.players;
+            const latestYou = latestPlayers.find((p) => p.playerId === you.playerId) ?? you;
+
+            await engine.prepareCoopOpenWorldAsync(
+              latestYou,
+              latestPlayers,
+              (pct, label) => updateLoadingProgress(token, pct, label)
+            );
+            if (transitionTokenRef.current !== token) return;
+
+            const postPreloadSession = coopClientRef.current?.session;
+            if (postPreloadSession && postPreloadSession.sessionId === session.sessionId) {
+              engine.syncCoopPlayers(postPreloadSession.players);
+            }
+          }
+          if (transitionTokenRef.current !== token) return;
+
+          activeWorldModeRef.current = 'open_world';
+          setShowCoop(false);
+          setShowLevels(false);
+          setShowSettings(false);
+          setPhase('playing');
+          setIsTransitioningToPlay(false);
+
+          await waitAnimationFrames(2);
+          finishLoadingTransition(token);
+        } catch (err) {
+          console.error('[SERPENTIS][COOP] Failed to enter Co-Op Open World', err);
+          if (transitionTokenRef.current === token) {
+            abortLoadingTransition();
+          }
+          setCoopError('Failed to initialize the Co-Op Open World scene. Please try again.');
+          setShowCoop(true);
         }
-        if (transitionTokenRef.current !== token) return;
-
-        activeWorldModeRef.current = 'open_world';
-        setShowCoop(false);
-        setShowLevels(false);
-        setShowSettings(false);
-        setPhase('playing');
-        setIsTransitioningToPlay(false);
-
-        await waitAnimationFrames(2);
-        finishLoadingTransition(token);
       })();
     },
-    [beginLoadingTransition, updateLoadingProgress, finishLoadingTransition]
+    [beginLoadingTransition, updateLoadingProgress, finishLoadingTransition, abortLoadingTransition]
   );
 
   useEffect(() => {
@@ -460,6 +518,9 @@ export default function App() {
         onStatusChange: (status) => {
           setCoopStatus(status);
         },
+        onPendingActionChange: (action) => {
+          setCoopPendingAction(action);
+        },
         onWelcome: (info) => {
           setCoopFriendCode(info.friendCode);
           setCoopName(info.name);
@@ -499,6 +560,14 @@ export default function App() {
             return;
           }
 
+          if (!reconnectRestore && coopLaunchIntentRef.current === 'stay_in_lobby') {
+            coopLaunchIntentRef.current = 'auto_enter';
+            setCoopNotice(`Online Co-Op Room ${session.sessionCode} ready — share your Join Code!`);
+            window.setTimeout(() => setCoopNotice(null), 4200);
+            return;
+          }
+
+          coopLaunchIntentRef.current = 'auto_enter';
           launchCoopWorld(session, you);
         },
         onPlayerJoined: () => {
@@ -653,32 +722,39 @@ export default function App() {
       setIsTransitioningToPlay(true);
 
       void (async () => {
-        await waitAnimationFrames(1);
-        if (transitionTokenRef.current !== token) return;
+        try {
+          await waitAnimationFrames(1);
+          if (transitionTokenRef.current !== token) return;
 
-        await preloadCoreAssets();
-        if (transitionTokenRef.current !== token) return;
+          await preloadCoreAssets();
+          if (transitionTokenRef.current !== token) return;
 
-        const engine = engineRef.current;
-        if (engine) {
-          await engine.prepareLevelAsync(targetId, (pct, label) =>
-            updateLoadingProgress(token, pct, label)
-          );
+          const engine = engineRef.current;
+          if (engine) {
+            await engine.prepareLevelAsync(targetId, (pct, label) =>
+              updateLoadingProgress(token, pct, label)
+            );
+          }
+          if (transitionTokenRef.current !== token) return;
+
+          activeWorldModeRef.current = 'sector';
+          setShowCoop(false);
+          setShowLevels(false);
+          setShowSettings(false);
+          setPhase('playing');
+          setIsTransitioningToPlay(false);
+
+          await waitAnimationFrames(2);
+          finishLoadingTransition(token);
+        } catch (err) {
+          console.error('[SERPENTIS] Failed to launch sector', err);
+          if (transitionTokenRef.current === token) {
+            abortLoadingTransition();
+          }
         }
-        if (transitionTokenRef.current !== token) return;
-
-        activeWorldModeRef.current = 'sector';
-        setShowCoop(false);
-        setShowLevels(false);
-        setShowSettings(false);
-        setPhase('playing');
-        setIsTransitioningToPlay(false);
-
-        await waitAnimationFrames(2);
-        finishLoadingTransition(token);
       })();
     },
-    [saveData, exitActiveCoopIfNeeded, beginLoadingTransition, updateLoadingProgress, finishLoadingTransition]
+    [saveData, exitActiveCoopIfNeeded, beginLoadingTransition, updateLoadingProgress, finishLoadingTransition, abortLoadingTransition]
   );
 
   const handleStartOpenWorld = useCallback(() => {
@@ -693,32 +769,39 @@ export default function App() {
     setIsTransitioningToPlay(true);
 
     void (async () => {
-      await waitAnimationFrames(1);
-      if (transitionTokenRef.current !== token) return;
+      try {
+        await waitAnimationFrames(1);
+        if (transitionTokenRef.current !== token) return;
 
-      await preloadCoreAssets();
-      if (transitionTokenRef.current !== token) return;
+        await preloadCoreAssets();
+        if (transitionTokenRef.current !== token) return;
 
-      const engine = engineRef.current;
-      if (engine) {
-        await engine.prepareOpenWorldAsync(
-          (pct, label) => updateLoadingProgress(token, pct, label),
-          savedCheckpointId
-        );
+        const engine = engineRef.current;
+        if (engine) {
+          await engine.prepareOpenWorldAsync(
+            (pct, label) => updateLoadingProgress(token, pct, label),
+            savedCheckpointId
+          );
+        }
+        if (transitionTokenRef.current !== token) return;
+
+        activeWorldModeRef.current = 'open_world';
+        setShowCoop(false);
+        setShowLevels(false);
+        setShowSettings(false);
+        setPhase('playing');
+        setIsTransitioningToPlay(false);
+
+        await waitAnimationFrames(2);
+        finishLoadingTransition(token);
+      } catch (err) {
+        console.error('[SERPENTIS] Failed to launch Open World', err);
+        if (transitionTokenRef.current === token) {
+          abortLoadingTransition();
+        }
       }
-      if (transitionTokenRef.current !== token) return;
-
-      activeWorldModeRef.current = 'open_world';
-      setShowCoop(false);
-      setShowLevels(false);
-      setShowSettings(false);
-      setPhase('playing');
-      setIsTransitioningToPlay(false);
-
-      await waitAnimationFrames(2);
-      finishLoadingTransition(token);
     })();
-  }, [exitActiveCoopIfNeeded, beginLoadingTransition, updateLoadingProgress, finishLoadingTransition]);
+  }, [exitActiveCoopIfNeeded, beginLoadingTransition, updateLoadingProgress, finishLoadingTransition, abortLoadingTransition]);
 
   const handleRestart = useCallback(() => {
     void requestAndroidFullscreen(false);
@@ -732,31 +815,38 @@ export default function App() {
     setIsTransitioningToPlay(true);
 
     void (async () => {
-      await waitAnimationFrames(1);
-      if (transitionTokenRef.current !== token) return;
+      try {
+        await waitAnimationFrames(1);
+        if (transitionTokenRef.current !== token) return;
 
-      const engine = engineRef.current;
-      if (engine) {
-        if (isOW) {
-          saveOpenWorldCheckpointId(null);
-          await engine.restartOpenWorldAsync((pct, label) =>
-            updateLoadingProgress(token, pct, label)
-          );
-        } else {
-          await engine.restartLevelAsync((pct, label) =>
-            updateLoadingProgress(token, pct, label)
-          );
+        const engine = engineRef.current;
+        if (engine) {
+          if (isOW) {
+            saveOpenWorldCheckpointId(null);
+            await engine.restartOpenWorldAsync((pct, label) =>
+              updateLoadingProgress(token, pct, label)
+            );
+          } else {
+            await engine.restartLevelAsync((pct, label) =>
+              updateLoadingProgress(token, pct, label)
+            );
+          }
+        }
+        if (transitionTokenRef.current !== token) return;
+
+        setPhase('playing');
+        setIsTransitioningToPlay(false);
+
+        await waitAnimationFrames(2);
+        finishLoadingTransition(token);
+      } catch (err) {
+        console.error('[SERPENTIS] Failed to restart', err);
+        if (transitionTokenRef.current === token) {
+          abortLoadingTransition();
         }
       }
-      if (transitionTokenRef.current !== token) return;
-
-      setPhase('playing');
-      setIsTransitioningToPlay(false);
-
-      await waitAnimationFrames(2);
-      finishLoadingTransition(token);
     })();
-  }, [beginLoadingTransition, updateLoadingProgress, finishLoadingTransition]);
+  }, [beginLoadingTransition, updateLoadingProgress, finishLoadingTransition, abortLoadingTransition]);
 
   const handleRespawnCheckpoint = useCallback(() => {
     void requestAndroidFullscreen(false);
@@ -804,14 +894,16 @@ export default function App() {
 
   const handleCreateCoopSession = useCallback(() => {
     setCoopError(null);
-    coopClientRef.current?.createSession(loadSavedOpenWorldCheckpointId());
+    coopLaunchIntentRef.current = 'stay_in_lobby';
+    coopClientRef.current?.createSession(null);
   }, []);
 
   const handleJoinCoopByCode = useCallback((sessionCode: string) => {
     setCoopError(null);
+    coopLaunchIntentRef.current = 'auto_enter';
     coopClientRef.current?.joinSession({
       sessionCode,
-      savedCheckpointId: loadSavedOpenWorldCheckpointId(),
+      savedCheckpointId: null,
     });
   }, []);
 
@@ -828,11 +920,8 @@ export default function App() {
   const handleRespondCoopInvite = useCallback((inviteId: string, accept: boolean) => {
     setCoopError(null);
     setCoopInvites((prev) => prev.filter((i) => i.inviteId !== inviteId));
-    coopClientRef.current?.respondToInvite(
-      inviteId,
-      accept,
-      loadSavedOpenWorldCheckpointId()
-    );
+    coopLaunchIntentRef.current = accept ? 'auto_enter' : 'stay_in_lobby';
+    coopClientRef.current?.respondToInvite(inviteId, accept, null);
   }, []);
 
   const handleEnterCoopWorld = useCallback(() => {
@@ -868,7 +957,14 @@ export default function App() {
   const handleCloseCoop = useCallback(() => setShowCoop(false), []);
   const handleReconnectCoop = useCallback(() => {
     setCoopError(null);
-    coopClientRef.current?.connect();
+    coopClientRef.current?.retryConnect();
+  }, []);
+
+  const handleSaveCoopServerUrl = useCallback((url: string) => {
+    setCoopError(null);
+    setStoredCoopServerUrl(url);
+    const nextUrl = coopClientRef.current?.setWsUrl(url) ?? resolveDefaultCoopWsUrl();
+    setCoopServerUrl(nextUrl);
   }, []);
 
   const handleVirtualMove = useCallback((x: number, y: number, run: boolean) => {
@@ -1085,6 +1181,9 @@ export default function App() {
       {showCoop && (
         <CoopModal
           status={coopStatus}
+          pendingAction={coopPendingAction}
+          serverUrl={coopServerUrl}
+          initialJoinCode={initialCoopParams.joinCode}
           localPlayerId={coopPlayerId}
           localFriendCode={coopFriendCode}
           localName={coopName}
@@ -1095,6 +1194,7 @@ export default function App() {
           noticeBanner={coopNotice}
           inActiveCoopPlay={Boolean(coopSession && isOpenWorldHud)}
           onNameChange={handleCoopNameChange}
+          onSaveServerUrl={handleSaveCoopServerUrl}
           onReconnect={handleReconnectCoop}
           onCreateSession={handleCreateCoopSession}
           onJoinSessionByCode={handleJoinCoopByCode}

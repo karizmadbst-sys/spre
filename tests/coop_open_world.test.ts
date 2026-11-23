@@ -2,14 +2,24 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as THREE from 'three';
 import WebSocket from 'ws';
+import { CoopHubDO } from '../cloudflare/src/index.ts';
 import { createAppServer } from '../server.ts';
-import { CoopClient } from '../src/coop/CoopClient.ts';
+import {
+  CoopClient,
+  normalizeCoopWsUrl,
+  type CoopPendingAction,
+} from '../src/coop/CoopClient.ts';
 import { COOP_MAX_PLAYERS, type CoopPlayerSnapshot } from '../src/coop/types.ts';
 import { PoolGameEngine } from '../src/game/engine.ts';
 import { createPlayerRig, disposeEntityResources } from '../src/game/entities.ts';
-import { getAllWorldCheckpoints, getWorldRegionDef, OPEN_WORLD_SPAWN } from '../src/game/openWorld.ts';
+import {
+  getAllWorldCheckpoints,
+  getWorldRegionDef,
+  getWorldRegionMeta,
+  OPEN_WORLD_SPAWN,
+} from '../src/game/openWorld.ts';
 import type { TextureBundle } from '../src/game/textures.ts';
-import type { HudSnapshot } from '../src/game/types.ts';
+import type { CharacterId, HudSnapshot } from '../src/game/types.ts';
 
 if (typeof (globalThis as { window?: unknown }).window === 'undefined') {
   (globalThis as { window?: unknown }).window = { devicePixelRatio: 1 };
@@ -88,7 +98,7 @@ function createMockTextures(): TextureBundle {
 
 async function waitFor<T>(
   predicate: () => T | null | undefined | false,
-  timeoutMs = 5000,
+  timeoutMs = 7000,
   label = 'condition'
 ): Promise<T> {
   const start = Date.now();
@@ -100,108 +110,226 @@ async function waitFor<T>(
   throw new Error(`Timed out waiting for: ${label}`);
 }
 
-function createHarnessEngine(textures: TextureBundle) {
+function createFullOpenWorldHarnessEngine(
+  textures: TextureBundle,
+  characterId: CharacterId = 'male'
+) {
   const eng = Object.create(PoolGameEngine.prototype) as any;
-  eng.container = {};
+  const hudHistory: HudSnapshot[] = [];
+
   eng.disposed = false;
+  eng.suspended = false;
   eng.contextLost = false;
+  eng.overlayOccluded = false;
+  eng.pendingSync = false;
+  eng.rafId = 1; // avoid browser RAF loops in Node
+  eng.timerId = 0;
+  eng.phase = 'menu';
   eng.isSoftwareGl = true;
   eng.isLowEndGpu = true;
   eng.isTouchDevice = false;
   eng.activeQuality = 'smooth';
   eng.activeRenderDist = 96;
+  eng.activePointLightLimit = 2;
+  eng.dynamicResScale = 1.0;
+  eng.localCharacterId = characterId;
+  eng.settings = {
+    quality: 'smooth',
+    mouseSensitivity: 1.0,
+    invertY: true,
+    touchControls: 'off',
+    masterVolume: 0.7,
+    musicVolume: 0.5,
+    sfxVolume: 0.8,
+    muted: true,
+  };
+
   eng.scene = new THREE.Scene();
   eng.levelGroup = new THREE.Group();
   eng.scene.add(eng.levelGroup);
   eng.camera = new THREE.PerspectiveCamera(68, 16 / 9, 0.1, 200);
+  eng.renderer = {
+    domElement: {
+      clientWidth: 1280,
+      clientHeight: 720,
+      releasePointerCapture: () => {},
+    },
+    shadowMap: { enabled: false, autoUpdate: false, type: THREE.PCFShadowMap },
+    capabilities: { getMaxAnisotropy: () => 4 },
+    setPixelRatio: () => {},
+    getPixelRatio: () => 1,
+    setSize: () => {},
+    compile: () => {},
+    toneMappingExposure: 1.14,
+    getContext: () => null,
+    render: () => {},
+  };
+  eng.composer = null;
+  eng.horrorPass = null;
   eng.textures = textures;
+  eng.uCausticEnabled = { value: 0 };
+  eng.uCausticRangeSq = { value: 40 * 40 };
+  eng.uCausticTime = { value: 0 };
+  eng.uMistTime = { value: 0 };
+  eng.uWaterQuality = { value: 0 };
+  eng.uTexelSize = { value: new THREE.Vector2(1 / 1280, 1 / 720) };
+  eng.uVignette = { value: 0 };
+  eng.dustPoints = null;
+  eng.dustMat = null;
+  eng.baseCausticEnabled = 0;
+  eng.horrorVisualActive = false;
+  eng.horrorVisualBlend = 0;
+  eng.horrorSpotLight = null;
+  eng.baseFogColor = new THREE.Color('#0c1e24');
+  eng.underwaterFogColor = new THREE.Color('#0b2a32');
+  eng.baseFogDensity = 0.015;
+  eng.baseHemiColor = new THREE.Color('#5a808a');
+  eng.baseHemiIntensity = 0.72;
+  eng.baseRimIntensity = 0.46;
+  eng.baseKeyIntensity = 1.25;
+
   eng.sound = {
     unlock: () => {},
-    stopEatingScreams: () => {},
+    playCheckpoint: () => {},
+    playEatingStrike: () => {},
+    playSwallowGulp: () => {},
+    playCharacterEatingScream: () => {},
+    playSnakeSwallowingAudio: () => {},
+    playSnakeFinalGulpAudio: () => {},
+    updateEatingScreamPosition: () => {},
+    updateSnakeEatingAudioPosition: () => {},
+    updateSnakeSwimmingAudio: () => {},
+    pruneSnakeSwimmingAudio: () => {},
     stopSnakeSwimmingAudio: () => {},
     stopAttackEatingAudio: () => {},
-    playCheckpoint: () => {},
-    playStep: () => {},
-    playSplash: () => {},
+    stopEatingScreams: () => {},
+    playJumpscare: () => {},
+    playSerpentEmerge: () => {},
+    playVictory: () => {},
+    updateAtmosphere: () => {},
     playJump: () => {},
     playLand: () => {},
-    playEatingStrike: () => {},
-    playJumpscare: () => {},
-    updateAtmosphere: () => {},
+    playSplash: () => {},
+    playStep: () => {},
+    playPlatformWarn: () => {},
+    playPush: () => {},
+    updateAudio: () => {},
+    setVolumes: () => {},
     prewarmAsync: async () => {},
   };
+
+  eng.callbacks = {
+    onHudUpdate: (snap: HudSnapshot) => {
+      hudHistory.push(snap);
+    },
+    onPhaseChange: () => {},
+  };
+  eng._hudHistory = hudHistory;
+
+  eng.playerRig = createPlayerRig(textures, 0x52e0b6, false, characterId);
+  eng.scene.add(eng.playerRig.root);
+  eng.playerPos = new THREE.Vector3();
+  eng.playerVel = new THREE.Vector3();
+  eng.playerYaw = Math.PI;
+  eng.activeSpawn = new THREE.Vector3();
+  eng.activeWorldMode = 'sector';
   eng.currentLevel = getWorldRegionDef(1);
-  eng.activeWorldMode = 'open_world';
   eng.owChunks = new Map();
-  eng.owMats = null;
+  eng.owMaterials = null;
   eng.owCheckpointMeta = new Map();
   eng.owActivatedCheckpointIds = new Set();
   eng.owCurrentRegionId = 1;
   eng.owCheckpointId = null;
   eng.owCheckpointRegionId = 1;
-  eng.owCheckpointLabel = 'Region 01 Entry Dock';
+  eng.owCheckpointLabel = null;
   eng.owCheckpointYaw = Math.PI;
   eng.owLastStreamX = NaN;
   eng.owLastStreamZ = NaN;
   eng.owTargetAtmo = null;
-  eng.platforms = [];
-  eng.dynamicPlatforms = [];
-  eng.staticChunks = [];
-  eng.walls = [];
-  eng.spatialGrid = null;
-  eng.checkpoints = [];
-  eng.monsters = [];
-  eng.pointLightPool = [];
-  eng.levelLights = [];
-  eng.levelQualityMaterials = [];
-  eng.levelShadowReceivers = [];
-  eng.levelDisposables = [];
-  eng.splashPool = [];
-  eng.splashMaxActive = 0;
-  eng.splashHasActive = false;
-  eng.splashMesh = { userData: { hadActive: false }, count: 0, instanceMatrix: { needsUpdate: false } };
+  eng.coopMode = false;
+  eng.coopLocalPlayerId = null;
+  eng.coopDeathSeq = 0;
+  eng.coopRespawnSentForSeq = 0;
+  eng.coopRespawnAppliedForSeq = 0;
+  eng.coopEmitTimer = 0;
+
+  eng.activeCheckpointIndex = 0;
+  eng.checkpointNotice = null;
+  eng.checkpointNoticeTimer = 0;
+  eng.levelTimeRemaining = 0;
+  eng.levelTimeElapsed = 0;
+  eng.simTime = 0;
+  eng.platformTime = 0;
+  eng.camYaw = 0;
+  eng.camPitch = 0.25;
+  eng.camDist = 5.0;
+  eng.camShake = 0;
+  eng.lastCamThirdPerson = true;
+  eng.pendingLookDx = 0;
+  eng.pendingLookDy = 0;
+  eng.activeDragPointerId = null;
+  eng.isDraggingLook = false;
+  eng.inWater = false;
+  eng.wasInWater = false;
+  eng.waterJumpTimer = 0;
+  eng.waterJumpCooldown = 0;
+  eng.coyoteTimer = 0;
+  eng.jumpBufferTimer = 0;
+  eng.stamina = 100;
+  eng.exhausted = false;
+  eng.grounded = false;
+  eng.stoodPlatform = null;
+  eng.lastAnimState = 'idle';
+  eng.lastHorizSpeed = 0;
+  eng.spRespawning = false;
   eng.heldKeys = new Set();
   eng.virtualMove = { x: 0, y: 0 };
   eng.virtualRun = false;
   eng.virtualAutoRun = false;
-  eng.localCharacterId = 'male';
-  eng.playerRig = createPlayerRig(textures, 0x52e0b6, false, 'male');
-  eng.scene.add(eng.playerRig.root);
-  eng.playerPos = new THREE.Vector3(OPEN_WORLD_SPAWN.x, OPEN_WORLD_SPAWN.y, OPEN_WORLD_SPAWN.z);
-  eng.playerVel = new THREE.Vector3();
-  eng.playerYaw = Math.PI;
-  eng.activeSpawn = new THREE.Vector3(OPEN_WORLD_SPAWN.x, OPEN_WORLD_SPAWN.y, OPEN_WORLD_SPAWN.z);
-  eng.activeCheckpointIndex = 0;
-  eng.simTime = 0;
-  eng.platformTime = 0;
-  eng.levelTimeRemaining = 0;
-  eng.levelTimeElapsed = 0;
+  eng.monsters = [];
+  eng.platforms = [];
+  eng.dynamicPlatforms = [];
+  eng.walls = [];
+  eng.staticChunks = [];
+  eng.checkpoints = [];
+  eng.levelLights = [];
+  eng.pointLightPool = [];
+  eng.levelDisposables = [];
+  eng.levelShadowReceivers = [];
+  eng.levelQualityMaterials = [];
+  eng.splashPool = [];
+  eng.splashMaxActive = 0;
+  eng.splashMesh = {
+    userData: { hadActive: false },
+    count: 0,
+    setMatrixAt: () => {},
+    instanceMatrix: { needsUpdate: false },
+  };
+  eng.ensureLoopRunning = () => {};
+  eng.prewarmSceneShaders = () => {};
+  eng.exitPortal = null;
+  eng.waterMesh = null;
+  eng.waterMat = null;
+  eng.hemiLight = null;
+  eng.rimLight = null;
+  eng.keyLight = null;
+  eng._lastCullCamX = NaN;
+  eng._lastCullCamZ = NaN;
+  eng._lastLightCamX = NaN;
+  eng._lastLightCamZ = NaN;
+  eng.currentFps = 60;
+  eng.isPointerLocked = false;
+  eng.deathReason = null;
   eng.jumpscareTimer = 0;
   eng.jumpscareMonster = null;
-  eng.deathReason = null;
-  eng.phase = 'playing';
-  eng.camYaw = 0;
-  eng.camPitch = 0.24;
-  eng.camDist = 5;
-  eng.lastAnimState = 'idle';
-  eng.lastHorizSpeed = 0;
-  eng.settings = {
-    mouseSensitivity: 1,
-    invertY: false,
-    masterVolume: 0.5,
-    musicVolume: 0.5,
-    sfxVolume: 0.5,
-    muted: true,
-    quality: 'smooth',
-    touchControls: 'off',
-  };
-  eng.baseFogColor = new THREE.Color('#091318');
-  eng.underwaterFogColor = new THREE.Color('#03090c');
-  eng.baseHemiColor = new THREE.Color('#4f7284');
-  eng.horrorVisualBlend = 0;
-  eng.horrorVisualActive = false;
-  eng.uCausticEnabled = { value: 0 };
-  eng.uWaterQuality = { value: 0 };
+  eng.playerWaterEpoch = 0;
+  eng.playerInWaterSession = false;
+  eng.pendingClimbIntimidation = false;
+  eng.isWatchedFreezeActive = false;
+  eng.watchFreezeGraceTimer = 0;
+  eng.watchMoveAttempted = false;
+  eng.watchAnchorX = 0;
+  eng.watchAnchorZ = 0;
   eng.lastHudSnap = {
     levelId: -1,
     worldMode: '',
@@ -227,296 +355,641 @@ function createHarnessEngine(textures: TextureBundle) {
     isPointerLocked: false,
     deathReason: null,
   };
-  eng.callbacks = {
-    onHudUpdate: (_s: HudSnapshot) => {},
-    onPhaseChange: () => {},
-  };
-  eng.ensureLoopRunning = () => {};
-  eng.prewarmSceneShaders = () => {};
-  eng.applyQualityToRenderer = () => {};
-  eng.snapPlayCameraImmediate = () => {};
-  eng.updateEnvironmentFX = () => {};
-  eng.spawnSplash = () => {};
+
   return eng;
 }
 
-test('Co-Op Open World server + client session, invites, movement, independent checkpoints, eaten/respawn, and reconnect restoration', async () => {
-  const srv = await createAppServer({ attachVite: false });
+test('TEST A–F: Live multi-client Co-Op Open World join-by-code, mutual visibility, multi-region streaming (R10/R20), independent checkpoints & auto-respawn, reconnect without duplicates, PC+Android, and Vite WS upgrade', async () => {
+  const srv = await createAppServer({ attachVite: true });
   await new Promise<void>((resolve) => srv.server.listen(0, '127.0.0.1', () => resolve()));
   const addr = srv.server.address() as { port: number };
+  const baseHttp = `http://127.0.0.1:${addr.port}`;
   const wsUrl = `ws://127.0.0.1:${addr.port}/ws/coop`;
-  const httpUrl = `http://127.0.0.1:${addr.port}/api/health`;
 
-  const hostEvents = {
-    welcomes: 0,
-    sessions: [] as string[],
-    peerMoves: 0,
-    eatenEvents: 0,
-    respawns: [] as string[],
-    peerCheckpoints: [] as string[],
-  };
-  const guestEvents = {
-    welcomes: 0,
-    invites: [] as string[],
-    sessions: [] as string[],
-    reconnectRestores: 0,
-    confirmedCheckpoints: [] as string[],
-    respawns: [] as { playerId: string; checkpointId: string | null }[],
-  };
+  const textures = createMockTextures();
+  const engA = createFullOpenWorldHarnessEngine(textures, 'male');
+  const engB = createFullOpenWorldHarnessEngine(textures, 'female');
 
-  const host = new CoopClient({
-    playerId: 'coop_host_alpha',
-    name: 'HostAlpha',
+  const errorsA: string[] = [];
+  const errorsB: string[] = [];
+  const pendingHistoryA: CoopPendingAction[] = [];
+  const reconnectRestoresB: number[] = [];
+
+  const clientA = new CoopClient({
+    playerId: 'pc_player_alpha',
+    name: 'DiverAlpha',
     characterId: 'male',
     platform: 'pc',
     wsUrl,
     webSocketFactory: (u) => new WebSocket(u) as unknown as globalThis.WebSocket,
     callbacks: {
-      onWelcome: () => {
-        hostEvents.welcomes += 1;
-      },
+      onPendingActionChange: (act) => pendingHistoryA.push(act),
       onSessionState: (session) => {
-        hostEvents.sessions.push(session.sessionCode);
+        if (engA.isCoopMode()) {
+          engA.syncCoopPlayers(session.players);
+        }
       },
-      onPlayerMoved: () => {
-        hostEvents.peerMoves += 1;
+      onPlayerJoined: () => {
+        if (clientA.session && engA.isCoopMode()) {
+          engA.syncCoopPlayers(clientA.session.players);
+        }
       },
-      onPlayerCheckpoint: (info) => {
-        hostEvents.peerCheckpoints.push(info.checkpointId);
+      onPlayerLeft: () => {
+        if (clientA.session && engA.isCoopMode()) {
+          engA.syncCoopPlayers(clientA.session.players);
+        }
       },
-      onPlayerEaten: () => {
-        hostEvents.eatenEvents += 1;
+      onPlayerConnection: (playerId, connected) => {
+        engA.applyCoopPlayerConnection(playerId, connected);
       },
-      onPlayerRespawn: (r) => {
-        hostEvents.respawns.push(r.playerId);
+      onPlayerMoved: (move) => {
+        engA.updateCoopPlayerMove(move);
       },
+      onPlayerEaten: (ev) => {
+        engA.applyCoopPlayerEaten(ev);
+      },
+      onPlayerRespawn: (respawn) => {
+        engA.applyCoopPlayerRespawn(respawn);
+      },
+      onError: (e) => errorsA.push(`${e.code}:${e.message}`),
     },
   });
 
-  const guest = new CoopClient({
-    playerId: 'coop_guest_beta',
-    name: 'GuestBeta',
+  const clientB = new CoopClient({
+    playerId: 'android_player_beta',
+    name: 'DiverBeta',
     characterId: 'female',
     platform: 'android',
     wsUrl,
     webSocketFactory: (u) => new WebSocket(u) as unknown as globalThis.WebSocket,
     callbacks: {
-      onWelcome: () => {
-        guestEvents.welcomes += 1;
-      },
-      onInviteReceived: (inv) => {
-        guestEvents.invites.push(inv.inviteId);
-      },
-      onSessionState: (session, _you, reconnectRestore) => {
-        guestEvents.sessions.push(session.sessionCode);
+      onSessionState: (session, you, reconnectRestore) => {
         if (reconnectRestore) {
-          guestEvents.reconnectRestores += 1;
+          reconnectRestoresB.push(session.players.length);
+          engB.setCoopMode(true, you.playerId);
+          engB.syncCoopPlayers(session.players);
         }
       },
-      onCheckpointConfirmed: (cp) => {
-        guestEvents.confirmedCheckpoints.push(cp.checkpointId);
+      onPlayerJoined: () => {
+        if (clientB.session && engB.isCoopMode()) {
+          engB.syncCoopPlayers(clientB.session.players);
+        }
       },
-      onPlayerRespawn: (r) => {
-        guestEvents.respawns.push({ playerId: r.playerId, checkpointId: r.checkpointId });
+      onPlayerLeft: () => {
+        if (clientB.session && engB.isCoopMode()) {
+          engB.syncCoopPlayers(clientB.session.players);
+        }
       },
+      onPlayerConnection: (playerId, connected) => {
+        engB.applyCoopPlayerConnection(playerId, connected);
+      },
+      onPlayerMoved: (move) => {
+        engB.updateCoopPlayerMove(move);
+      },
+      onPlayerEaten: (ev) => {
+        engB.applyCoopPlayerEaten(ev);
+      },
+      onPlayerRespawn: (respawn) => {
+        engB.applyCoopPlayerRespawn(respawn);
+      },
+      onError: (e) => errorsB.push(`${e.code}:${e.message}`),
     },
   });
 
+  const extraClients: CoopClient[] = [];
+
   try {
-    // 1. Health endpoint reports coop capability
-    const healthRes = await fetch(httpUrl);
+    // Verify live HTTP endpoints alongside Vite middleware
+    const healthRes = await fetch(`${baseHttp}/api/health`);
     assert.equal(healthRes.status, 200);
-    const healthJson = (await healthRes.json()) as { ok: boolean; coop?: boolean };
-    assert.equal(healthJson.ok, true);
-    assert.equal(healthJson.coop, true);
+    const health = (await healthRes.json()) as { ok: boolean; coop: boolean };
+    assert.equal(health.ok, true);
+    assert.equal(health.coop, true);
 
-    // 2. Connect host & guest concurrently and verify presence
-    host.connect();
-    guest.connect();
-    await waitFor(() => hostEvents.welcomes > 0 && guestEvents.welcomes > 0, 5000, 'both welcomes');
-    await waitFor(
-      () => host.onlineUsers.some((u) => u.playerId === guest.playerId),
-      5000,
-      'guest presence visible to host'
-    );
+    const missingCodeRes = await fetch(`${baseHttp}/api/coop/session/NOPE99`);
+    assert.equal(missingCodeRes.status, 404);
 
-    // 3. Host creates session and invites guest by Friend Code
-    host.createSession();
-    const session = await waitFor(() => host.session, 5000, 'host session created');
-    assert.equal(session.maxPlayers, COOP_MAX_PLAYERS);
-    assert.equal(session.players.length, 1);
+    // ------------------------------------------------------------------
+    // TEST A: Client A creates session -> Client B joins using Join Code
+    // ------------------------------------------------------------------
+    clientA.createSession(null);
+    const createdA = await waitFor(() => clientA.session, 5000, 'Client A creates session');
+    assert.ok(createdA.sessionId.length >= 4);
+    assert.ok(createdA.sessionCode.length >= 6);
+    assert.equal(createdA.players.length, 1);
+    assert.ok(pendingHistoryA.includes('create'));
+    assert.equal(clientA.pendingAction, null);
 
-    host.inviteFriend({ friendCode: guest.friendCode });
-    const inviteId = await waitFor(() => guestEvents.invites[0], 5000, 'guest receives invite');
-    guest.respondToInvite(inviteId, true);
+    // Confirm REST session lookup returns valid room metadata
+    const lookupRes = await fetch(`${baseHttp}/api/coop/session/${createdA.sessionCode}`);
+    assert.equal(lookupRes.status, 200);
+    const lookupJson = (await lookupRes.json()) as {
+      exists: boolean;
+      sessionId: string;
+      sessionCode: string;
+      playerCount: number;
+    };
+    assert.equal(lookupJson.exists, true);
+    assert.equal(lookupJson.sessionId, createdA.sessionId);
+    assert.equal(lookupJson.sessionCode, createdA.sessionCode);
+    assert.equal(lookupJson.playerCount, 1);
 
-    await waitFor(
-      () => (host.session?.players.length ?? 0) === 2 && (guest.session?.players.length ?? 0) === 2,
-      5000,
-      'both players in session'
-    );
-
-    // 4. Guest movement sync reaches host
-    guest.sendPlayerState({
-      x: 4.5,
-      y: 1.2,
-      z: -12.0,
-      yaw: 1.25,
-      animState: 'run',
-      horizSpeed: 8.2,
-      regionId: 1,
-      inWater: false,
+    // Client B joins using lowercase / padded join code
+    clientB.joinSession({
+      sessionCode: ` ${createdA.sessionCode.toLowerCase()} `,
+      savedCheckpointId: null,
     });
-    await waitFor(() => hostEvents.peerMoves > 0, 5000, 'host receives guest movement');
-
-    // 5. Independent checkpoints: guest activates Region 2 checkpoint while host stays at Entry Dock
-    const allCps = getAllWorldCheckpoints();
-    const r2Cp = allCps.find((c) => c.regionId === 2) ?? allCps[1];
-    assert.ok(r2Cp, 'Region 2 checkpoint must exist');
-    guest.sendActivateCheckpoint(r2Cp.id, r2Cp.x, r2Cp.y + 0.5, r2Cp.z);
 
     await waitFor(
       () =>
-        guestEvents.confirmedCheckpoints.includes(r2Cp.id) &&
-        hostEvents.peerCheckpoints.includes(r2Cp.id),
+        clientA.session?.players.length === 2 && clientB.session?.players.length === 2
+          ? true
+          : false,
       5000,
-      'independent checkpoint confirmed & broadcast'
+      'TEST A: both clients see 2 players in same session'
     );
-    const hostSelf = host.session!.players.find((p) => p.playerId === host.playerId);
-    const guestSelf = guest.session!.players.find((p) => p.playerId === guest.playerId);
-    assert.equal(hostSelf?.checkpointId, null, 'Host checkpoint must remain independent');
-    assert.equal(guestSelf?.checkpointId, r2Cp.id, 'Guest checkpoint must update independently');
 
-    // 6. Player eaten + authoritative server respawn at Guest's Region 2 checkpoint
-    guest.sendPlayerEaten({
-      deathSeq: 1,
-      monsterId: 'ow_serpent_1',
-      monsterX: r2Cp.x,
-      monsterY: -0.2,
-      monsterZ: r2Cp.z - 2,
-      playerX: r2Cp.x,
-      playerY: 0.4,
-      playerZ: r2Cp.z,
-      playerYaw: 0.4,
+    assert.equal(clientB.session!.sessionId, createdA.sessionId);
+    assert.equal(clientB.session!.sessionCode, createdA.sessionCode);
+    assert.notEqual(clientA.playerId, clientB.playerId);
+    assert.equal(clientB.pendingAction, null);
+
+    // ------------------------------------------------------------------
+    // TEST B: Both players enter Open World, see each other & sync moves
+    // ------------------------------------------------------------------
+    const snapA = clientA.session!.players.find((p) => p.playerId === clientA.playerId)!;
+    const snapB = clientB.session!.players.find((p) => p.playerId === clientB.playerId)!;
+    assert.equal(snapA.platform, 'pc');
+    assert.equal(snapB.platform, 'android');
+
+    engA.startCoopOpenWorld(snapA, clientA.session!.players);
+    engB.startCoopOpenWorld(snapB, clientB.session!.players);
+
+    const peerBonA = engA.coopPlayers.get(clientB.playerId);
+    const peerAonB = engB.coopPlayers.get(clientA.playerId);
+    assert.ok(peerBonA, 'Player A must have Player B character rig spawned');
+    assert.ok(peerAonB, 'Player B must have Player A character rig spawned');
+    assert.equal(peerBonA.rig.root.parent, engA.scene);
+    assert.equal(peerAonB.rig.root.parent, engB.scene);
+    assert.equal(peerBonA.rig.root.visible, true);
+    assert.equal(peerAonB.rig.root.visible, true);
+
+    // Move both players near Region 01 and verify live interpolation sync
+    const startAx = peerAonB.pos.x;
+    const startBx = peerBonA.pos.x;
+    clientA.sendPlayerState({
+      x: startAx + 3.6,
+      y: 1.2,
+      z: -6.5,
+      yaw: 0.75,
+      animState: 'run',
+      horizSpeed: 8.4,
+      regionId: 1,
+      inWater: false,
     });
-    await waitFor(() => hostEvents.eatenEvents > 0, 5000, 'host receives eaten broadcast');
+    clientB.sendPlayerState({
+      x: startBx - 4.1,
+      y: 1.2,
+      z: -9.2,
+      yaw: -1.1,
+      animState: 'swim',
+      horizSpeed: 5.5,
+      regionId: 1,
+      inWater: true,
+    });
 
-    guest.sendRequestRespawn(1);
-    const guestRespawn = await waitFor(
-      () => guestEvents.respawns.find((r) => r.playerId === guest.playerId),
+    await waitFor(
+      () =>
+        Math.abs(peerAonB.targetPos.x - (startAx + 3.6)) < 0.01 &&
+        Math.abs(peerBonA.targetPos.x - (startBx - 4.1)) < 0.01,
       5000,
-      'guest receives authoritative respawn'
+      'TEST B: bidirectional movement telemetry arrives'
     );
-    assert.equal(guestRespawn.checkpointId, r2Cp.id);
-    assert.ok(hostEvents.respawns.includes(guest.playerId));
 
-    // 7. Reconnect preserves session & guest independent checkpoint
-    guest.forceReconnect();
-    await waitFor(() => guestEvents.reconnectRestores > 0, 5000, 'guest session restored after reconnect');
-    const restoredGuest = guest.session!.players.find((p) => p.playerId === guest.playerId);
-    assert.equal(restoredGuest?.checkpointId, r2Cp.id);
+    engA.updateRemoteCoopPlayers(0.05);
+    engB.updateRemoteCoopPlayers(0.05);
+    assert.notEqual(peerBonA.pos.x, startBx, 'Remote character B moves in Player A engine');
+    assert.notEqual(peerAonB.pos.x, startAx, 'Remote character A moves in Player B engine');
+
+    // ------------------------------------------------------------------
+    // TEST C: Simultaneous exploration of Region 10 and Region 20
+    // ------------------------------------------------------------------
+    const region10Meta = getWorldRegionMeta(10);
+    const region20Meta = getWorldRegionMeta(20);
+
+    engA.playerPos.set(region10Meta.spawn[0], region10Meta.spawn[1], region10Meta.spawn[2]);
+    engA.updateOpenWorldStreaming(true);
+    assert.ok(engA.owChunks.has('r_10'), 'Engine A streams Region 10 geometry');
+
+    engB.playerPos.set(region20Meta.spawn[0], region20Meta.spawn[1], region20Meta.spawn[2]);
+    engB.updateOpenWorldStreaming(true);
+    assert.ok(engB.owChunks.has('r_20'), 'Engine B streams Region 20 geometry');
+
+    clientA.sendPlayerState({
+      x: region10Meta.spawn[0],
+      y: region10Meta.spawn[1],
+      z: region10Meta.spawn[2],
+      yaw: 0.2,
+      animState: 'walk',
+      horizSpeed: 4.1,
+      regionId: 10,
+      inWater: false,
+    });
+    clientB.sendPlayerState({
+      x: region20Meta.spawn[0],
+      y: region20Meta.spawn[1],
+      z: region20Meta.spawn[2],
+      yaw: 1.8,
+      animState: 'run',
+      horizSpeed: 8.6,
+      regionId: 20,
+      inWater: false,
+    });
+
+    await waitFor(
+      () =>
+        peerAonB.regionId === 10 &&
+        peerBonA.regionId === 20 &&
+        Math.hypot(peerAonB.targetPos.x - region10Meta.spawn[0], peerAonB.targetPos.z - region10Meta.spawn[2]) < 1 &&
+        Math.hypot(peerBonA.targetPos.x - region20Meta.spawn[0], peerBonA.targetPos.z - region20Meta.spawn[2]) < 1,
+      5000,
+      'TEST C: both players see R10 & R20 positions inside the same session'
+    );
+    assert.equal(clientA.session!.sessionId, clientB.session!.sessionId);
+
+    // ------------------------------------------------------------------
+    // TEST D: Independent checkpoints (R10 vs R20) & snake-eaten respawn
+    // ------------------------------------------------------------------
+    const allCps = getAllWorldCheckpoints();
+    const cp10 = allCps.find((c) => c.regionId === 10);
+    const cp20 = allCps.find((c) => c.regionId === 20);
+    assert.ok(cp10 && cp20, 'Region 10 and Region 20 checkpoints must exist');
+
+    clientA.sendActivateCheckpoint(cp10.id, cp10.x, cp10.y + 0.5, cp10.z);
+    clientB.sendActivateCheckpoint(cp20.id, cp20.x, cp20.y + 0.5, cp20.z);
+
+    await waitFor(() => {
+      const aA = clientA.session?.players.find((p) => p.playerId === clientA.playerId);
+      const bA = clientA.session?.players.find((p) => p.playerId === clientB.playerId);
+      const aB = clientB.session?.players.find((p) => p.playerId === clientA.playerId);
+      const bB = clientB.session?.players.find((p) => p.playerId === clientB.playerId);
+      return (
+        aA?.checkpointId === cp10.id &&
+        bA?.checkpointId === cp20.id &&
+        aB?.checkpointId === cp10.id &&
+        bB?.checkpointId === cp20.id
+      );
+    }, 5000, 'TEST D: independent R10 and R20 checkpoints synchronized');
+
+    // Simulate both players eaten by serpents
+    engA.phase = 'jumpscare';
+    engA.deathReason = 'caught';
+    engA.coopDeathSeq = 1;
+    clientA.sendPlayerEaten({
+      deathSeq: 1,
+      monsterId: 'serpent_r10',
+      monsterX: cp10.x,
+      monsterY: -0.2,
+      monsterZ: cp10.z - 2,
+      playerX: cp10.x + 2,
+      playerY: 0.4,
+      playerZ: cp10.z,
+      playerYaw: 0,
+    });
+
+    engB.phase = 'jumpscare';
+    engB.deathReason = 'caught';
+    engB.coopDeathSeq = 1;
+    clientB.sendPlayerEaten({
+      deathSeq: 1,
+      monsterId: 'serpent_r20',
+      monsterX: cp20.x,
+      monsterY: -0.2,
+      monsterZ: cp20.z - 2,
+      playerX: cp20.x - 2,
+      playerY: 0.4,
+      playerZ: cp20.z,
+      playerYaw: 1.2,
+    });
+
+    await waitFor(
+      () => peerAonB.alive === false && peerBonA.alive === false,
+      5000,
+      'TEST D: both clients observe teammate eaten states'
+    );
+
+    clientA.sendRequestRespawn(1);
+    clientB.sendRequestRespawn(1);
+
+    await waitFor(
+      () =>
+        engA.phase === 'playing' &&
+        engB.phase === 'playing' &&
+        engA.owCheckpointId === cp10.id &&
+        engB.owCheckpointId === cp20.id,
+      5000,
+      'TEST D: both engines automatically respawn at independent checkpoints'
+    );
+
+    assert.equal(engA.owCheckpointRegionId, 10);
+    assert.equal(engB.owCheckpointRegionId, 20);
+    assert.ok(Math.hypot(engA.playerPos.x - cp10.x, engA.playerPos.z - cp10.z) < 0.1);
+    assert.ok(Math.hypot(engB.playerPos.x - cp20.x, engB.playerPos.z - cp20.z) < 0.1);
+    assert.equal(engA.playerRig.root.visible, true);
+    assert.equal(engB.playerRig.root.visible, true);
+    assert.equal(clientA.session!.sessionId, createdA.sessionId);
+    assert.equal(clientB.session!.sessionId, createdA.sessionId);
+
+    // ------------------------------------------------------------------
+    // TEST E: Temporary disconnect & duplicate-free reconnect
+    // ------------------------------------------------------------------
+    clientB.forceReconnect();
+
+    await waitFor(
+      () =>
+        clientA.session?.players.find((p) => p.playerId === clientB.playerId)?.connected === false,
+      5000,
+      'TEST E: Client A stays in active room while Client B drops temporarily'
+    );
+    assert.equal(clientA.status, 'connected');
+    assert.equal(clientA.session!.sessionId, createdA.sessionId);
+
+    await waitFor(
+      () =>
+        reconnectRestoresB.length > 0 &&
+        clientA.session?.players.find((p) => p.playerId === clientB.playerId)?.connected === true,
+      6000,
+      'TEST E: Client B reconnects seamlessly to exact same room'
+    );
+    assert.equal(clientB.session!.sessionId, createdA.sessionId);
+    assert.equal(clientA.session!.players.length, 2, 'No duplicate player after reconnect on Client A');
+    assert.equal(clientB.session!.players.length, 2, 'No duplicate player after reconnect on Client B');
+    assert.equal(engA.coopPlayers.size, 1, 'Engine A has exactly 1 remote rig (no duplicate)');
+    assert.equal(engB.coopPlayers.size, 1, 'Engine B has exactly 1 remote rig (no duplicate)');
+    assert.equal(
+      clientB.session!.players.find((p) => p.playerId === clientB.playerId)?.checkpointId,
+      cp20.id,
+      'Client B checkpoint preserved across reconnect'
+    );
+
+    // ------------------------------------------------------------------
+    // TEST F: Capacity enforcement (max 6 players -> 7th gets SESSION_FULL),
+    //         URL normalization & explicit error handling (invalid code),
+    //         and host-transfer when 1 player explicitly leaves
+    // ------------------------------------------------------------------
+    for (let slot = 3; slot <= COOP_MAX_PLAYERS; slot += 1) {
+      const extra = new CoopClient({
+        playerId: `squad_extra_${slot}`,
+        name: `Squad${slot}`,
+        characterId: slot % 2 === 0 ? 'female' : 'male',
+        platform: slot % 2 === 0 ? 'android' : 'pc',
+        wsUrl,
+        webSocketFactory: (u) => new WebSocket(u) as unknown as globalThis.WebSocket,
+      });
+      extraClients.push(extra);
+      extra.joinSession({ sessionCode: createdA.sessionCode, savedCheckpointId: null });
+      await waitFor(() => extra.session, 5000, `extra player ${slot} joined`);
+    }
+    assert.equal(clientA.session!.players.length, COOP_MAX_PLAYERS);
+
+    // 7th player must be rejected cleanly with SESSION_FULL (no crash / hang)
+    let seventhErr = '';
+    const seventh = new CoopClient({
+      playerId: 'squad_seventh_overflow',
+      name: 'Overflow',
+      characterId: 'male',
+      platform: 'pc',
+      wsUrl,
+      webSocketFactory: (u) => new WebSocket(u) as unknown as globalThis.WebSocket,
+      callbacks: {
+        onError: (e) => {
+          seventhErr = e.code;
+        },
+      },
+    });
+    extraClients.push(seventh);
+    seventh.joinSession({ sessionCode: createdA.sessionCode, savedCheckpointId: null });
+    await waitFor(() => seventhErr, 5000, '7th player receives SESSION_FULL');
+    assert.equal(seventhErr, 'SESSION_FULL');
+    assert.equal(seventh.pendingAction, null);
+
+    // Invalid Join Code emits SESSION_NOT_FOUND cleanly
+    let badCodeErr = '';
+    const badCodeClient = new CoopClient({
+      playerId: 'bad_code_tester',
+      name: 'BadCode',
+      characterId: 'male',
+      platform: 'pc',
+      wsUrl,
+      webSocketFactory: (u) => new WebSocket(u) as unknown as globalThis.WebSocket,
+      callbacks: {
+        onError: (e) => {
+          badCodeErr = e.code;
+        },
+      },
+    });
+    extraClients.push(badCodeClient);
+    badCodeClient.joinSession({ sessionCode: 'ZZZZ99', savedCheckpointId: null });
+    await waitFor(() => badCodeErr, 5000, 'invalid code error');
+    assert.equal(badCodeErr, 'SESSION_NOT_FOUND');
+    assert.equal(badCodeClient.pendingAction, null);
+
+    // Host leaves explicitly -> session stays alive with remaining players and transfers hostId
+    clientA.leaveSession();
+    await waitFor(
+      () => clientB.session && clientB.session.hostId !== clientA.playerId,
+      5000,
+      'Host transfer on explicit leave without terminating room'
+    );
+    assert.equal(clientB.session!.sessionId, createdA.sessionId);
+
+    assert.deepEqual(errorsA, []);
+    assert.deepEqual(errorsB, []);
   } finally {
-    host.disconnect(false);
-    guest.disconnect(false);
+    clientA.disconnect(false);
+    clientB.disconnect(false);
+    for (const ec of extraClients) ec.disconnect(false);
+    engA.clearCoopState();
+    engB.clearCoopState();
+    engA.playerRig.dispose();
+    engB.playerRig.dispose();
+    disposeEntityResources(textures);
+    textures.dispose();
     await srv.close();
   }
 });
 
-test('PoolGameEngine Co-Op rig lifecycle: spawn peers, interpolate movement, eaten/respawn & clean disposal', () => {
-  const textures = createMockTextures();
-  const eng = createHarnessEngine(textures);
+test('CoopClient URL normalization, invalid code validation, and unreachable server timeout/error recovery', async () => {
+  assert.equal(
+    normalizeCoopWsUrl('https://coop.serpentis.workers.dev'),
+    'wss://coop.serpentis.workers.dev/ws/coop'
+  );
+  assert.equal(
+    normalizeCoopWsUrl('https://coop.serpentis.workers.dev/ws'),
+    'wss://coop.serpentis.workers.dev/ws/coop'
+  );
+  assert.equal(
+    normalizeCoopWsUrl('wss://coop.serpentis.workers.dev/ws/coop/'),
+    'wss://coop.serpentis.workers.dev/ws/coop'
+  );
+  assert.equal(
+    normalizeCoopWsUrl('http://192.168.1.50:3000'),
+    'ws://192.168.1.50:3000/ws/coop'
+  );
 
-  const peer1: CoopPlayerSnapshot = {
-    playerId: 'peer_1',
-    friendCode: 'SRP-111111',
-    name: 'DiverOne',
-    characterId: 'female',
-    platform: 'pc',
-    connected: true,
-    alive: true,
-    deathSeq: 0,
-    slotIndex: 1,
-    colorHex: '#6cb8ff',
-    x: 4,
-    y: 1.2,
-    z: -8,
-    yaw: 0.5,
-    animState: 'walk',
-    horizSpeed: 4.2,
-    regionId: 1,
-    inWater: false,
-    checkpointId: null,
-    checkpointRegionId: 1,
-    checkpointLabel: 'Region 01 Entry Dock',
-    checkpointX: 4,
-    checkpointY: 1.2,
-    checkpointZ: -8,
-    checkpointYaw: Math.PI,
+  const receivedErrors: { code: string; message: string }[] = [];
+  const deadClient = new CoopClient({
+    playerId: 'unreachable_tester',
+    name: 'DeadTest',
+    characterId: 'male',
+    platform: 'android',
+    wsUrl: 'ws://127.0.0.1:1/ws/coop',
+    connectTimeoutMs: 1500,
+    actionTimeoutMs: 2000,
+    webSocketFactory: (u) => new WebSocket(u) as unknown as globalThis.WebSocket,
+    callbacks: {
+      onError: (err) => receivedErrors.push(err),
+    },
+  });
+
+  // Short code caught client-side immediately without hanging
+  deadClient.joinSession({ sessionCode: 'ab', savedCheckpointId: null });
+  assert.equal(receivedErrors[0]?.code, 'INVALID_CODE');
+
+  // Unreachable endpoint fires CONNECTION_FAILED / CONNECTION_TIMEOUT and clears pendingAction
+  deadClient.createSession(null);
+  await waitFor(() => receivedErrors.length >= 2, 4000, 'unreachable server emits failure error');
+  assert.ok(
+    receivedErrors[1].code === 'CONNECTION_FAILED' ||
+      receivedErrors[1].code === 'CONNECTION_TIMEOUT' ||
+      receivedErrors[1].code === 'REQUEST_TIMEOUT'
+  );
+  assert.equal(deadClient.pendingAction, null);
+  deadClient.disconnect(false);
+});
+
+test('Cloudflare Worker CoopHubDO parity: HTTP health/lookup and two-client create/join flow', async () => {
+  // Minimal two-ended WebSocketPair shim so CoopHubDO can run directly in Node tests
+  type Listener = (ev: { data?: string }) => void;
+  class MemSocket {
+    public readyState = 0;
+    public peer!: MemSocket;
+    private listeners = new Map<string, Listener[]>();
+    public accept(): void {}
+    public addEventListener(type: string, cb: Listener): void {
+      const list = this.listeners.get(type) ?? [];
+      list.push(cb);
+      this.listeners.set(type, list);
+    }
+    public send(data: string): void {
+      if (this.readyState !== 1) return;
+      queueMicrotask(() => {
+        for (const cb of this.peer.listeners.get('message') ?? []) {
+          cb({ data });
+        }
+      });
+    }
+    public close(): void {
+      if (this.readyState === 3) return;
+      this.readyState = 3;
+      this.peer.readyState = 3;
+      queueMicrotask(() => {
+        for (const cb of this.listeners.get('close') ?? []) cb({});
+        for (const cb of this.peer.listeners.get('close') ?? []) cb({});
+      });
+    }
+  }
+  const OrigResponse = globalThis.Response;
+  const origWsPair = (globalThis as { WebSocketPair?: unknown }).WebSocketPair;
+  let lastClientSocket: MemSocket | null = null;
+  (globalThis as { Response: unknown }).Response = class extends OrigResponse {
+    constructor(body?: BodyInit | null, init?: ResponseInit & { webSocket?: unknown }) {
+      if (init?.status === 101 && init.webSocket) {
+        super(null, { status: 200 });
+        Object.defineProperty(this, 'status', { value: 101 });
+        Object.defineProperty(this, 'webSocket', { value: init.webSocket });
+        return;
+      }
+      super(body, init);
+    }
+  };
+  (globalThis as { WebSocketPair?: unknown }).WebSocketPair = class {
+    public 0: MemSocket;
+    public 1: MemSocket;
+    constructor() {
+      const a = new MemSocket();
+      const b = new MemSocket();
+      a.peer = b;
+      b.peer = a;
+      this[0] = a;
+      this[1] = b;
+      lastClientSocket = a;
+    }
   };
 
-  eng.setCoopMode(true, 'local_player');
-  eng.syncCoopPlayers([peer1]);
+  let hub: CoopHubDO | null = null;
+  try {
+    hub = new CoopHubDO();
 
-  assert.equal(eng.coopPlayers.size, 1);
-  const remote = eng.coopPlayers.get('peer_1');
-  assert.ok(remote);
-  assert.equal(remote.rig.root.parent, eng.scene);
-  assert.ok(remote.nameplate instanceof THREE.Sprite);
+    const makeHubClient = (playerId: string, name: string, platform: 'pc' | 'android') =>
+      new CoopClient({
+        playerId,
+        name,
+        characterId: platform === 'android' ? 'female' : 'male',
+        platform,
+        wsUrl: 'wss://edge.example.com/ws/coop',
+        webSocketFactory: () => {
+          void hub!.fetch(
+            new Request('https://edge.example.com/ws/coop', {
+              headers: { Upgrade: 'websocket' },
+            })
+          );
+          const clientSock = lastClientSocket!;
+          queueMicrotask(() => {
+            clientSock.readyState = 1;
+            clientSock.peer.readyState = 1;
+            for (const cb of (clientSock as unknown as { listeners: Map<string, Listener[]> }).listeners.get('open') ?? []) {
+              cb({});
+            }
+          });
+          return clientSock as unknown as globalThis.WebSocket;
+        },
+      });
 
-  eng.updateCoopPlayerMove({
-    playerId: 'peer_1',
-    x: 8,
-    y: 1.5,
-    z: -14,
-    yaw: 1.4,
-    animState: 'run',
-    horizSpeed: 8.5,
-    regionId: 1,
-    inWater: false,
-    alive: true,
-  });
-  assert.equal(remote.targetPos.x, 8);
-  assert.equal(remote.targetPos.z, -14);
-  assert.equal(remote.animState, 'run');
+    const cA = makeHubClient('cf_pc_1', 'EdgePC', 'pc');
+    const cB = makeHubClient('cf_mob_2', 'EdgeAndroid', 'android');
 
-  eng.updateRemoteCoopPlayers(0.05);
-  assert.ok(remote.pos.x > 4, 'Remote position must interpolate toward target');
+    cA.createSession(null);
+    const sA = await waitFor(() => cA.session, 4000, 'CF Worker session created');
 
-  eng.applyCoopPlayerEaten({
-    playerId: 'peer_1',
-    deathSeq: 1,
-    monsterId: 'm1',
-    monsterX: 8,
-    monsterY: -0.2,
-    monsterZ: -15,
-    playerX: 8,
-    playerY: 1.2,
-    playerZ: -14,
-    playerYaw: 1.4,
-  });
-  assert.equal(remote.alive, false);
+    const healthRes = await hub.fetch(new Request('https://edge.example.com/api/health'));
+    assert.equal(healthRes.status, 200);
+    const healthJson = (await healthRes.json()) as { runtime: string; activeSessions: number };
+    assert.equal(healthJson.runtime, 'cloudflare-durable-object');
+    assert.equal(healthJson.activeSessions, 1);
 
-  eng.applyCoopPlayerRespawn({
-    playerId: 'peer_1',
-    deathSeq: 1,
-    checkpointId: null,
-    checkpointRegionId: 1,
-    checkpointLabel: 'Region 01 Entry Dock',
-    x: 2,
-    y: 1.2,
-    z: -4,
-    yaw: Math.PI,
-    regionId: 1,
-  });
-  assert.equal(remote.alive, true);
-  assert.equal(remote.pos.x, 2);
-  assert.equal(remote.pos.z, -4);
+    const lookupRes = await hub.fetch(
+      new Request(`https://edge.example.com/api/coop/session/${sA.sessionCode}`)
+    );
+    assert.equal(lookupRes.status, 200);
 
-  eng.clearCoopState();
-  assert.equal(eng.coopPlayers.size, 0);
-  assert.equal(remote.rig.root.parent, null, 'Remote rig must be detached from scene on clear');
+    cB.joinSession({ sessionCode: sA.sessionCode, savedCheckpointId: null });
+    await waitFor(
+      () => cA.session?.players.length === 2 && cB.session?.players.length === 2,
+      4000,
+      'CF Worker join-by-code matches room'
+    );
+    assert.equal(cB.session!.sessionId, sA.sessionId);
 
-  eng.playerRig.dispose();
-  disposeEntityResources(textures);
-  textures.dispose();
+    cA.disconnect(false);
+    cB.disconnect(false);
+  } finally {
+    hub?.destroy();
+    (globalThis as { Response: unknown }).Response = OrigResponse;
+    if (origWsPair === undefined) {
+      delete (globalThis as { WebSocketPair?: unknown }).WebSocketPair;
+    } else {
+      (globalThis as { WebSocketPair?: unknown }).WebSocketPair = origWsPair;
+    }
+  }
 });
