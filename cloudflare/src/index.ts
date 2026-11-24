@@ -104,6 +104,7 @@ interface EdgeCoopSessionInternal {
   sessionId: string;
   sessionCode: string;
   hostId: string;
+  started: boolean;
   maxPlayers: number;
   createdAt: number;
   players: Map<string, EdgeCoopPlayerInternal>;
@@ -310,6 +311,7 @@ export class CoopHubDO {
       sessionId: session.sessionId,
       sessionCode: session.sessionCode,
       hostId: session.hostId,
+      started: session.started,
       maxPlayers: session.maxPlayers,
       players: Array.from(session.players.values()).map((p) => this.toPlayerSnapshot(p)),
     };
@@ -441,6 +443,9 @@ export class CoopHubDO {
       case 'coop:join_session':
         this.joinSessionByIdentifier(client, msg.sessionId, msg.sessionCode, msg.savedCheckpointId ?? null);
         break;
+      case 'coop:start_session':
+        this.handleStartSession(client);
+        break;
       case 'coop:leave_session':
         this.leaveSession(client);
         break;
@@ -532,6 +537,7 @@ export class CoopHubDO {
       sessionId,
       sessionCode,
       hostId: client.playerId,
+      started: false,
       maxPlayers: this.maxPlayers,
       createdAt: Date.now(),
       players: new Map(),
@@ -551,6 +557,39 @@ export class CoopHubDO {
       you: this.toPlayerSnapshot(hostPlayer),
     });
     this.schedulePresenceBroadcast();
+  }
+
+  private handleStartSession(client: EdgeConnectedClient): void {
+    if (!client.sessionId) {
+      this.sendWs(client.ws, {
+        type: 'coop:error',
+        code: 'SESSION_NOT_FOUND',
+        message: 'Create or join a room before starting the game.',
+      });
+      return;
+    }
+    const session = this.sessions.get(client.sessionId);
+    if (!session) {
+      this.sendWs(client.ws, {
+        type: 'coop:error',
+        code: 'SESSION_NOT_FOUND',
+        message: 'Co-op room not found or has expired.',
+      });
+      return;
+    }
+    if (session.hostId !== client.playerId) {
+      this.sendWs(client.ws, {
+        type: 'coop:error',
+        code: 'NOT_HOST',
+        message: 'Only the room host can start the game.',
+      });
+      return;
+    }
+    session.started = true;
+    this.broadcastToSession(session, {
+      type: 'coop:session_started',
+      session: this.toSessionSnapshot(session),
+    });
   }
 
   private allocateSlotIndex(session: EdgeCoopSessionInternal): number {

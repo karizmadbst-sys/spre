@@ -17,7 +17,15 @@ import {
   type CoopSessionSnapshot,
 } from './types.ts';
 
-export type CoopPendingAction = 'create' | 'join' | 'invite' | null;
+import {
+  normalizeCoopWsUrl,
+  isPackagedNativeHost,
+  resolveCoopWsUrl,
+} from './config.ts';
+
+export { normalizeCoopWsUrl, isPackagedNativeHost, resolveCoopWsUrl };
+
+export type CoopPendingAction = 'create' | 'join' | 'start' | 'invite' | null;
 
 export interface CoopClientCallbacks {
   onStatusChange?: (status: CoopConnectionStatus) => void;
@@ -32,6 +40,7 @@ export interface CoopClientCallbacks {
     you: CoopPlayerSnapshot,
     reconnectRestore?: boolean
   ) => void;
+  onSessionStarted?: (session: CoopSessionSnapshot, you: CoopPlayerSnapshot) => void;
   onPlayerJoined?: (player: CoopPlayerSnapshot, hostId: string) => void;
   onPlayerLeft?: (playerId: string, hostId: string) => void;
   onPlayerConnection?: (playerId: string, connected: boolean) => void;
@@ -58,109 +67,6 @@ export interface CoopClientOptions {
   actionTimeoutMs?: number;
   webSocketFactory?: (url: string) => WebSocket;
   callbacks?: CoopClientCallbacks;
-}
-
-export const STORAGE_COOP_SERVER_URL_KEY = 'serpentis_coop_server_url_v1';
-
-export function normalizeCoopWsUrl(rawUrl: string): string {
-  const trimmed = rawUrl.trim().replace(/\/+$/, '');
-  if (!trimmed) return '';
-
-  const withScheme = /^wss?:\/\//i.test(trimmed)
-    ? trimmed
-    : /^https:\/\//i.test(trimmed)
-      ? trimmed.replace(/^https:\/\//i, 'wss://')
-      : /^http:\/\//i.test(trimmed)
-        ? trimmed.replace(/^http:\/\//i, 'ws://')
-        : `wss://${trimmed}`;
-
-  try {
-    const parsed = new URL(withScheme);
-    const cleanPath = parsed.pathname.replace(/\/+$/, '');
-    if (!cleanPath || cleanPath === '/') {
-      parsed.pathname = '/ws/coop';
-    } else if (cleanPath === '/ws') {
-      parsed.pathname = '/ws/coop';
-    } else if (!cleanPath.endsWith('/ws/coop')) {
-      parsed.pathname = `${cleanPath}/ws/coop`;
-    }
-    return parsed.toString();
-  } catch {
-    if (withScheme.endsWith('/ws/coop')) return withScheme;
-    if (withScheme.endsWith('/ws')) return `${withScheme}/coop`;
-    return `${withScheme}/ws/coop`;
-  }
-}
-
-export function getStoredCoopServerUrl(): string {
-  try {
-    if (typeof localStorage === 'undefined') return '';
-    return localStorage.getItem(STORAGE_COOP_SERVER_URL_KEY)?.trim() || '';
-  } catch {
-    return '';
-  }
-}
-
-export function setStoredCoopServerUrl(rawUrl: string): string {
-  const trimmed = rawUrl.trim();
-  const normalized = trimmed ? normalizeCoopWsUrl(trimmed) : '';
-  try {
-    if (typeof localStorage !== 'undefined') {
-      if (normalized) {
-        localStorage.setItem(STORAGE_COOP_SERVER_URL_KEY, normalized);
-      } else {
-        localStorage.removeItem(STORAGE_COOP_SERVER_URL_KEY);
-      }
-    }
-  } catch {
-    // ignore storage errors
-  }
-  return normalized;
-}
-
-export function isPackagedNativeHost(): boolean {
-  if (typeof window === 'undefined' || !window.location) return false;
-  const host = (window.location.hostname || '').toLowerCase();
-  const proto = (window.location.protocol || '').toLowerCase();
-  if (proto === 'capacitor:' || proto === 'tauri:' || proto === 'file:') return true;
-  if (host === 'tauri.localhost') return true;
-  const cap = (window as unknown as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor;
-  if (cap && typeof cap.isNativePlatform === 'function' && cap.isNativePlatform()) {
-    return true;
-  }
-  return false;
-}
-
-export function resolveDefaultCoopWsUrl(): string {
-  const stored = getStoredCoopServerUrl();
-  if (stored) {
-    return normalizeCoopWsUrl(stored);
-  }
-
-  const metaEnv =
-    typeof import.meta !== 'undefined'
-      ? (import.meta as { env?: Record<string, string | undefined> }).env
-      : undefined;
-  const envWs = metaEnv?.VITE_WS_BASE_URL;
-  if (envWs && typeof envWs === 'string' && envWs.trim()) {
-    return normalizeCoopWsUrl(envWs);
-  }
-  const envApi = metaEnv?.VITE_API_BASE_URL;
-  if (envApi && typeof envApi === 'string' && envApi.trim()) {
-    return normalizeCoopWsUrl(envApi);
-  }
-
-  if (typeof window === 'undefined' || !window.location) {
-    return 'ws://127.0.0.1:3000/ws/coop';
-  }
-  if (isPackagedNativeHost()) {
-    return '';
-  }
-  if (window.location.protocol !== 'http:' && window.location.protocol !== 'https:') {
-    return '';
-  }
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${window.location.host}/ws/coop`;
 }
 
 export function detectCoopPlatform(): CoopPlatform {
@@ -209,7 +115,7 @@ export class CoopClient {
     this.name = sanitizePlayerName(options.name);
     this.characterId = options.characterId;
     this.platform = options.platform;
-    this.wsUrl = options.wsUrl ? normalizeCoopWsUrl(options.wsUrl) : resolveDefaultCoopWsUrl();
+    this.wsUrl = options.wsUrl ? normalizeCoopWsUrl(options.wsUrl) : resolveCoopWsUrl();
     this.connectTimeoutMs = Math.max(1500, options.connectTimeoutMs ?? 7000);
     this.actionTimeoutMs = Math.max(2000, options.actionTimeoutMs ?? 8500);
     this.webSocketFactory = options.webSocketFactory;
@@ -224,30 +130,6 @@ export class CoopClient {
     this.callbacks = callbacks;
   }
 
-  public setWsUrl(nextRawUrl: string): string {
-    const normalized = nextRawUrl.trim() ? normalizeCoopWsUrl(nextRawUrl) : resolveDefaultCoopWsUrl();
-    this.wsUrl = normalized;
-    this.reportedConnectionError = false;
-    this.reconnectAttempts = 0;
-    if (this.ws) {
-      const sock = this.ws;
-      this.ws = null;
-      this.stopPing();
-      this.clearConnectTimeout();
-      try {
-        sock.close();
-      } catch {
-        // ignore
-      }
-    }
-    if (this.wsUrl) {
-      this.connect();
-    } else {
-      this.setStatus('disconnected');
-    }
-    return this.wsUrl;
-  }
-
   public updateLocalProfile(next: { name?: string; characterId?: CharacterId }): void {
     if (next.name !== undefined) this.name = sanitizePlayerName(next.name);
     if (next.characterId !== undefined) this.characterId = next.characterId;
@@ -260,17 +142,7 @@ export class CoopClient {
 
   public connect(): void {
     if (!this.wsUrl) {
-      this.clearPendingAction();
-      this.setStatus('disconnected');
-      if (!this.reportedConnectionError) {
-        this.reportedConnectionError = true;
-        this.callbacks.onError?.({
-          code: 'SERVER_URL_MISSING',
-          message:
-            'No Co-Op server URL is configured for this app build. Enter your Co-Op server URL in Server Settings below to play online.',
-        });
-      }
-      return;
+      this.wsUrl = resolveCoopWsUrl();
     }
 
     if (this.ws && (this.ws.readyState === 0 || this.ws.readyState === 1)) {
@@ -291,7 +163,7 @@ export class CoopClient {
       this.setStatus('disconnected');
       this.failPendingAction(
         'CONNECTION_FAILED',
-        `Cannot open Co-Op connection to ${this.wsUrl}. Verify the server address and internet access.`
+        'Unable to reach the online server. Check your internet connection and tap Retry.'
       );
       return;
     }
@@ -307,13 +179,13 @@ export class CoopClient {
       }
       this.failPendingAction(
         'CONNECTION_TIMEOUT',
-        'Timed out connecting to Co-Op server. Check your internet connection or server address and tap Retry.'
+        'Timed out connecting to the online server. Check your internet connection and tap Retry.'
       );
       if (!this.reportedConnectionError) {
         this.reportedConnectionError = true;
         this.callbacks.onError?.({
           code: 'CONNECTION_TIMEOUT',
-          message: 'Timed out connecting to Co-Op server. Check your connection and tap Retry.',
+          message: 'Timed out connecting to the online server. Check your connection and tap Retry.',
         });
       }
     }, this.connectTimeoutMs);
@@ -389,13 +261,13 @@ export class CoopClient {
         if (this.pendingAction) {
           this.failPendingAction(
             'CONNECTION_FAILED',
-            'Unable to reach the Co-Op server. Check your internet connection or server URL and tap Retry.'
+            'Unable to reach the online server. Check your internet connection and tap Retry.'
           );
         } else if (!this.reportedConnectionError) {
           this.reportedConnectionError = true;
           this.callbacks.onError?.({
             code: 'CONNECTION_FAILED',
-            message: 'Unable to reach the Co-Op server. Check your internet connection and tap Retry.',
+            message: 'Unable to reach the online server. Check your internet connection and tap Retry.',
           });
         }
       }
@@ -541,10 +413,38 @@ export class CoopClient {
     }
   }
 
+  public startSession(): void {
+    if (!this.session) {
+      this.callbacks.onError?.({
+        code: 'SESSION_NOT_FOUND',
+        message: 'Create or join a room before starting the game.',
+      });
+      return;
+    }
+    this.reportedConnectionError = false;
+    this.reconnectAttempts = 0;
+    this.beginPendingAction(
+      'start',
+      'Timed out starting Open World game. Check your connection and try again.'
+    );
+    this.connect();
+    const msg: CoopClientMessage = { type: 'coop:start_session' };
+    this.pendingQueuedMessages = this.pendingQueuedMessages.filter(
+      (m) => m.type !== 'coop:start_session'
+    );
+    if (!this.send(msg)) {
+      this.pendingQueuedMessages.push(msg);
+    }
+  }
+
   public leaveSession(): void {
     this.clearPendingAction();
     this.pendingQueuedMessages = this.pendingQueuedMessages.filter(
-      (m) => m.type !== 'coop:create_session' && m.type !== 'coop:join_session' && m.type !== 'coop:invite_friend'
+      (m) =>
+        m.type !== 'coop:create_session' &&
+        m.type !== 'coop:join_session' &&
+        m.type !== 'coop:start_session' &&
+        m.type !== 'coop:invite_friend'
     );
     this.send({ type: 'coop:leave_session' });
     this.session = null;
@@ -676,7 +576,11 @@ export class CoopClient {
   private failPendingAction(code: string, message: string): void {
     const hadAction = Boolean(this.pendingAction);
     this.pendingQueuedMessages = this.pendingQueuedMessages.filter(
-      (m) => m.type !== 'coop:create_session' && m.type !== 'coop:join_session' && m.type !== 'coop:invite_friend'
+      (m) =>
+        m.type !== 'coop:create_session' &&
+        m.type !== 'coop:join_session' &&
+        m.type !== 'coop:start_session' &&
+        m.type !== 'coop:invite_friend'
     );
     this.clearPendingAction();
     if (hadAction) {
@@ -783,6 +687,20 @@ export class CoopClient {
         this.lastKnownCheckpointId = msg.you.checkpointId;
         this.flushPendingOnSessionReady();
         this.callbacks.onSessionState?.(msg.session, msg.you, msg.reconnectRestore);
+        break;
+      }
+
+      case 'coop:session_started': {
+        this.clearPendingAction();
+        this.session = msg.session;
+        const you =
+          msg.session.players.find((p) => p.playerId === this.playerId) ??
+          msg.session.players[0];
+        if (you) {
+          this.lastKnownCheckpointId = you.checkpointId;
+          this.flushPendingOnSessionReady();
+          this.callbacks.onSessionStarted?.(msg.session, you);
+        }
         break;
       }
 

@@ -51,16 +51,41 @@ export async function createAppServer(options: ServerOptions = {}) {
 
   let viteServer: { close: () => Promise<void> } | null = null;
   if (shouldAttachVite) {
+    const hmrDisabled = process.env.DISABLE_HMR === 'true';
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
         allowedHosts: true,
-        hmr: process.env.DISABLE_HMR === 'true' ? false : { server },
+        hmr: !hmrDisabled,
+        ws: hmrDisabled ? false : { server },
       },
       appType: 'spa',
     });
     viteServer = vite;
+    if (hmrDisabled) {
+      app.get('/@vite/client', async (_req, res, next) => {
+        try {
+          const transformed = await vite.transformRequest('/@vite/client');
+          if (!transformed?.code) {
+            next();
+            return;
+          }
+          const patchedCode = transformed.code
+            .replace(
+              /transport\.connect\(createHMRHandler\(handleMessage\)\);?/g,
+              '/* HMR WebSocket connection disabled via DISABLE_HMR */'
+            )
+            .replace(
+              /ws\.send\(JSON\.stringify\(data\)\)/g,
+              'if (ws && ws.readyState === 1) ws.send(JSON.stringify(data))'
+            );
+          res.status(200).type('application/javascript').send(patchedCode);
+        } catch (err) {
+          next(err);
+        }
+      });
+    }
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');

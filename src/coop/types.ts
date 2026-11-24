@@ -76,6 +76,7 @@ export interface CoopSessionSnapshot {
   sessionId: string;
   sessionCode: string;
   hostId: string;
+  started: boolean;
   maxPlayers: number;
   players: CoopPlayerSnapshot[];
 }
@@ -163,6 +164,9 @@ export type CoopClientMessage =
       lastKnownCheckpointId?: string | null;
     }
   | {
+      type: 'coop:start_session';
+    }
+  | {
       type: 'coop:leave_session';
     }
   | {
@@ -246,6 +250,10 @@ export type CoopServerMessage =
       session: CoopSessionSnapshot;
       you: CoopPlayerSnapshot;
       reconnectRestore?: boolean;
+    }
+  | {
+      type: 'coop:session_started';
+      session: CoopSessionSnapshot;
     }
   | {
       type: 'coop:player_joined';

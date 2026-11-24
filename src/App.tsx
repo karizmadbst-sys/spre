@@ -17,8 +17,6 @@ import { TouchControls, TouchControlsCustomizer } from './components/TouchContro
 import {
   CoopClient,
   detectCoopPlatform,
-  resolveDefaultCoopWsUrl,
-  setStoredCoopServerUrl,
   type CoopPendingAction,
 } from './coop/CoopClient';
 import {
@@ -108,13 +106,9 @@ function parseInitialCoopParams(): { joinCode: string; hasInviteLink: boolean } 
   }
   try {
     const url = new URL(window.location.href);
-    const serverParam = url.searchParams.get('server')?.trim();
-    if (serverParam) {
-      setStoredCoopServerUrl(serverParam);
-    }
     const rawCode = url.searchParams.get('coop') || '';
     const cleanCode = rawCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (serverParam || rawCode) {
+    if (rawCode || url.searchParams.has('server')) {
       url.searchParams.delete('coop');
       url.searchParams.delete('server');
       window.history.replaceState?.({}, '', url.toString());
@@ -241,7 +235,6 @@ export default function App() {
   const [coopFriendCode, setCoopFriendCode] = useState<string>(() => deriveFriendCode(coopPlayerId));
   const [coopStatus, setCoopStatus] = useState<CoopConnectionStatus>('disconnected');
   const [coopPendingAction, setCoopPendingAction] = useState<CoopPendingAction>(null);
-  const [coopServerUrl, setCoopServerUrl] = useState<string>(() => resolveDefaultCoopWsUrl());
   const [coopSession, setCoopSession] = useState<CoopSessionSnapshot | null>(null);
   const [coopOnlineUsers, setCoopOnlineUsers] = useState<CoopOnlineUser[]>([]);
   const [coopInvites, setCoopInvites] = useState<CoopInvite[]>([]);
@@ -283,7 +276,6 @@ export default function App() {
   const activeLevelIdRef = useRef<number>(1);
   const activeWorldModeRef = useRef<'sector' | 'open_world'>('sector');
   const activeCoopSessionIdRef = useRef<string | null>(null);
-  const coopLaunchIntentRef = useRef<'stay_in_lobby' | 'auto_enter'>('auto_enter');
   const phaseRef = useRef<GamePhase>('menu');
   const transitionTokenRef = useRef<number>(0);
   const fadeTimerRef = useRef<number | null>(null);
@@ -560,20 +552,32 @@ export default function App() {
             return;
           }
 
-          if (!reconnectRestore && coopLaunchIntentRef.current === 'stay_in_lobby') {
-            coopLaunchIntentRef.current = 'auto_enter';
-            setCoopNotice(`Online Co-Op Room ${session.sessionCode} ready — share your Join Code!`);
-            window.setTimeout(() => setCoopNotice(null), 4200);
+          if (session.started) {
+            launchCoopWorld(session, you);
             return;
           }
 
-          coopLaunchIntentRef.current = 'auto_enter';
+          setShowCoop(true);
+          if (session.hostId === you.playerId) {
+            setCoopNotice(`Room ${session.sessionCode} created — share your Room Code with friends!`);
+          } else {
+            setCoopNotice(`Joined Room ${session.sessionCode} — waiting for host to start.`);
+          }
+          window.setTimeout(() => setCoopNotice(null), 4200);
+        },
+        onSessionStarted: (session, you) => {
+          setCoopError(null);
+          setCoopInvites([]);
+          setCoopSession(cloneCoopSession(session));
           launchCoopWorld(session, you);
         },
-        onPlayerJoined: () => {
+        onPlayerJoined: (player) => {
           setCoopSession(cloneCoopSession(client.session));
           if (client.session && engineRef.current?.isCoopMode()) {
             engineRef.current.syncCoopPlayers(client.session.players);
+          } else if (client.session && !client.session.started) {
+            setCoopNotice(`${player.name} joined the room!`);
+            window.setTimeout(() => setCoopNotice(null), 3000);
           }
         },
         onPlayerLeft: () => {
@@ -894,17 +898,20 @@ export default function App() {
 
   const handleCreateCoopSession = useCallback(() => {
     setCoopError(null);
-    coopLaunchIntentRef.current = 'stay_in_lobby';
     coopClientRef.current?.createSession(null);
   }, []);
 
   const handleJoinCoopByCode = useCallback((sessionCode: string) => {
     setCoopError(null);
-    coopLaunchIntentRef.current = 'auto_enter';
     coopClientRef.current?.joinSession({
       sessionCode,
       savedCheckpointId: null,
     });
+  }, []);
+
+  const handleStartCoopSession = useCallback(() => {
+    setCoopError(null);
+    coopClientRef.current?.startSession();
   }, []);
 
   const handleInviteByFriendCode = useCallback((friendCode: string) => {
@@ -920,7 +927,6 @@ export default function App() {
   const handleRespondCoopInvite = useCallback((inviteId: string, accept: boolean) => {
     setCoopError(null);
     setCoopInvites((prev) => prev.filter((i) => i.inviteId !== inviteId));
-    coopLaunchIntentRef.current = accept ? 'auto_enter' : 'stay_in_lobby';
     coopClientRef.current?.respondToInvite(inviteId, accept, null);
   }, []);
 
@@ -958,13 +964,6 @@ export default function App() {
   const handleReconnectCoop = useCallback(() => {
     setCoopError(null);
     coopClientRef.current?.retryConnect();
-  }, []);
-
-  const handleSaveCoopServerUrl = useCallback((url: string) => {
-    setCoopError(null);
-    setStoredCoopServerUrl(url);
-    const nextUrl = coopClientRef.current?.setWsUrl(url) ?? resolveDefaultCoopWsUrl();
-    setCoopServerUrl(nextUrl);
   }, []);
 
   const handleVirtualMove = useCallback((x: number, y: number, run: boolean) => {
@@ -1182,7 +1181,6 @@ export default function App() {
         <CoopModal
           status={coopStatus}
           pendingAction={coopPendingAction}
-          serverUrl={coopServerUrl}
           initialJoinCode={initialCoopParams.joinCode}
           localPlayerId={coopPlayerId}
           localFriendCode={coopFriendCode}
@@ -1194,10 +1192,10 @@ export default function App() {
           noticeBanner={coopNotice}
           inActiveCoopPlay={Boolean(coopSession && isOpenWorldHud)}
           onNameChange={handleCoopNameChange}
-          onSaveServerUrl={handleSaveCoopServerUrl}
           onReconnect={handleReconnectCoop}
           onCreateSession={handleCreateCoopSession}
           onJoinSessionByCode={handleJoinCoopByCode}
+          onStartSession={handleStartCoopSession}
           onLeaveSession={handleLeaveCoopSession}
           onEnterCoopWorld={handleEnterCoopWorld}
           onInviteByFriendCode={handleInviteByFriendCode}

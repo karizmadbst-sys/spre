@@ -1,9 +1,15 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as THREE from 'three';
 import WebSocket from 'ws';
 import { CoopHubDO } from '../cloudflare/src/index.ts';
 import { createAppServer } from '../server.ts';
+import {
+  DEFAULT_PRODUCTION_COOP_WS_URL,
+  resolveCoopWsUrl,
+} from '../src/coop/config.ts';
 import {
   CoopClient,
   normalizeCoopWsUrl,
@@ -374,6 +380,9 @@ test('TEST A–F: Live multi-client Co-Op Open World join-by-code, mutual visibi
   const errorsB: string[] = [];
   const pendingHistoryA: CoopPendingAction[] = [];
   const reconnectRestoresB: number[] = [];
+  let startedCountA = 0;
+  let startedCountB = 0;
+  let sawDisconnectB = false;
 
   const clientA = new CoopClient({
     playerId: 'pc_player_alpha',
@@ -389,6 +398,9 @@ test('TEST A–F: Live multi-client Co-Op Open World join-by-code, mutual visibi
           engA.syncCoopPlayers(session.players);
         }
       },
+      onSessionStarted: () => {
+        startedCountA += 1;
+      },
       onPlayerJoined: () => {
         if (clientA.session && engA.isCoopMode()) {
           engA.syncCoopPlayers(clientA.session.players);
@@ -400,6 +412,9 @@ test('TEST A–F: Live multi-client Co-Op Open World join-by-code, mutual visibi
         }
       },
       onPlayerConnection: (playerId, connected) => {
+        if (playerId === 'android_player_beta' && !connected) {
+          sawDisconnectB = true;
+        }
         engA.applyCoopPlayerConnection(playerId, connected);
       },
       onPlayerMoved: (move) => {
@@ -429,6 +444,9 @@ test('TEST A–F: Live multi-client Co-Op Open World join-by-code, mutual visibi
           engB.setCoopMode(true, you.playerId);
           engB.syncCoopPlayers(session.players);
         }
+      },
+      onSessionStarted: () => {
+        startedCountB += 1;
       },
       onPlayerJoined: () => {
         if (clientB.session && engB.isCoopMode()) {
@@ -470,13 +488,14 @@ test('TEST A–F: Live multi-client Co-Op Open World join-by-code, mutual visibi
     assert.equal(missingCodeRes.status, 404);
 
     // ------------------------------------------------------------------
-    // TEST A: Client A creates session -> Client B joins using Join Code
+    // TEST A: Client A creates room (lobby) -> Client B joins by code -> Host starts game
     // ------------------------------------------------------------------
     clientA.createSession(null);
     const createdA = await waitFor(() => clientA.session, 5000, 'Client A creates session');
     assert.ok(createdA.sessionId.length >= 4);
     assert.ok(createdA.sessionCode.length >= 6);
     assert.equal(createdA.players.length, 1);
+    assert.equal(createdA.started, false, 'Host remains in lobby until Start Game is clicked');
     assert.ok(pendingHistoryA.includes('create'));
     assert.equal(clientA.pendingAction, null);
 
@@ -511,8 +530,26 @@ test('TEST A–F: Live multi-client Co-Op Open World join-by-code, mutual visibi
 
     assert.equal(clientB.session!.sessionId, createdA.sessionId);
     assert.equal(clientB.session!.sessionCode, createdA.sessionCode);
+    assert.equal(clientB.session!.started, false, 'Friend also sees lobby before Host starts');
     assert.notEqual(clientA.playerId, clientB.playerId);
     assert.equal(clientB.pendingAction, null);
+
+    // Non-host trying to start is rejected cleanly with NOT_HOST
+    clientB.startSession();
+    await waitFor(
+      () => errorsB.some((e) => e.startsWith('NOT_HOST:')),
+      4000,
+      'Non-host receives NOT_HOST'
+    );
+    errorsB.length = 0;
+
+    // Host starts the game -> BOTH clients receive coop:session_started
+    clientA.startSession();
+    await waitFor(
+      () => startedCountA === 1 && startedCountB === 1 && clientA.session?.started && clientB.session?.started,
+      5000,
+      'TEST A: Host Start Game broadcasts session_started to all lobby members'
+    );
 
     // ------------------------------------------------------------------
     // TEST B: Both players enter Open World, see each other & sync moves
@@ -706,8 +743,7 @@ test('TEST A–F: Live multi-client Co-Op Open World join-by-code, mutual visibi
     clientB.forceReconnect();
 
     await waitFor(
-      () =>
-        clientA.session?.players.find((p) => p.playerId === clientB.playerId)?.connected === false,
+      () => sawDisconnectB,
       5000,
       'TEST E: Client A stays in active room while Client B drops temporarily'
     );
@@ -819,7 +855,11 @@ test('TEST A–F: Live multi-client Co-Op Open World join-by-code, mutual visibi
   }
 });
 
-test('CoopClient URL normalization, invalid code validation, and unreachable server timeout/error recovery', async () => {
+test('Centralized automatic server endpoint configuration, zero manual server UI, and error recovery', async () => {
+  assert.equal(
+    DEFAULT_PRODUCTION_COOP_WS_URL,
+    'wss://ais-dev-jfab6bpsg7wtx4lde3o7tp-1013031700248.europe-west2.run.app/ws/coop'
+  );
   assert.equal(
     normalizeCoopWsUrl('https://coop.serpentis.workers.dev'),
     'wss://coop.serpentis.workers.dev/ws/coop'
@@ -836,6 +876,37 @@ test('CoopClient URL normalization, invalid code validation, and unreachable ser
     normalizeCoopWsUrl('http://192.168.1.50:3000'),
     'ws://192.168.1.50:3000/ws/coop'
   );
+
+  // Simulated Android Capacitor & Windows Tauri native hosts must resolve directly to DEFAULT_PRODUCTION_COOP_WS_URL
+  const origWin = (globalThis as { window?: unknown }).window;
+  try {
+    (globalThis as { window?: unknown }).window = {
+      location: { protocol: 'capacitor:', hostname: 'localhost', host: 'localhost' },
+      Capacitor: { isNativePlatform: () => true },
+    };
+    assert.equal(resolveCoopWsUrl(), DEFAULT_PRODUCTION_COOP_WS_URL);
+
+    (globalThis as { window?: unknown }).window = {
+      location: { protocol: 'https:', hostname: 'tauri.localhost', host: 'tauri.localhost' },
+    };
+    assert.equal(resolveCoopWsUrl(), DEFAULT_PRODUCTION_COOP_WS_URL);
+
+    (globalThis as { window?: unknown }).window = {
+      location: { protocol: 'https:', hostname: 'serpentis-game.pages.dev', host: 'serpentis-game.pages.dev' },
+    };
+    assert.equal(resolveCoopWsUrl(), DEFAULT_PRODUCTION_COOP_WS_URL);
+  } finally {
+    (globalThis as { window?: unknown }).window = origWin;
+  }
+
+  // UI must never display manual server URL / WSS settings inputs to normal players
+  const modalSrc = fs.readFileSync(path.join(process.cwd(), 'src/components/CoopModal.tsx'), 'utf8');
+  assert.equal(modalSrc.includes('Co-Op Server WebSocket Endpoint'), false);
+  assert.equal(modalSrc.includes('onSaveServerUrl'), false);
+  assert.equal(modalSrc.includes('Create Room'), true);
+  assert.equal(modalSrc.includes('Join Room'), true);
+  assert.equal(modalSrc.includes('Copy Code'), true);
+  assert.equal(modalSrc.includes('Start Game'), true);
 
   const receivedErrors: { code: string; message: string }[] = [];
   const deadClient = new CoopClient({
@@ -956,11 +1027,16 @@ test('Cloudflare Worker CoopHubDO parity: HTTP health/lookup and two-client crea
         },
       });
 
+    let startedEdgeA = 0;
+    let startedEdgeB = 0;
     const cA = makeHubClient('cf_pc_1', 'EdgePC', 'pc');
     const cB = makeHubClient('cf_mob_2', 'EdgeAndroid', 'android');
+    cA.setCallbacks({ onSessionStarted: () => (startedEdgeA += 1) });
+    cB.setCallbacks({ onSessionStarted: () => (startedEdgeB += 1) });
 
     cA.createSession(null);
     const sA = await waitFor(() => cA.session, 4000, 'CF Worker session created');
+    assert.equal(sA.started, false);
 
     const healthRes = await hub.fetch(new Request('https://edge.example.com/api/health'));
     assert.equal(healthRes.status, 200);
@@ -980,6 +1056,13 @@ test('Cloudflare Worker CoopHubDO parity: HTTP health/lookup and two-client crea
       'CF Worker join-by-code matches room'
     );
     assert.equal(cB.session!.sessionId, sA.sessionId);
+
+    cA.startSession();
+    await waitFor(
+      () => startedEdgeA === 1 && startedEdgeB === 1 && cA.session?.started && cB.session?.started,
+      4000,
+      'CF Worker host Start Game broadcasts to lobby'
+    );
 
     cA.disconnect(false);
     cB.disconnect(false);
